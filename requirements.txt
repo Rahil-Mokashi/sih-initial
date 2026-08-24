@@ -1,0 +1,21 @@
+# SIH26143 - Oil Spill Detection & Vessel Attribution Pipeline
+#
+# Install PyTorch separately FIRST with the CUDA-enabled wheel for your GPU,
+# then install the rest of this file. See DECISIONS.md for the exact command
+# used on the dev machine (RTX 4050, driver CUDA 13.1, wheel built for cu124).
+#
+#   venv\Scripts\pip.exe install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+torch
+torchvision
+rasterio          # read/write SAR GeoTIFFs
+numpy
+scipy              # Lee filter (uniform_filter); also a scikit-image dependency
+opencv-python
+scikit-image      # despeckling filters, image processing
+matplotlib
+requests
+xarray            # wind/current NetCDF (ERA5, ocean currents)
+netCDF4            # xarray's NetCDF backend
+geopandas          # AIS points, vessel tracks, spatial joins
+py7zr              # extract the .7z archives the Zenodo SAR dataset ships as
