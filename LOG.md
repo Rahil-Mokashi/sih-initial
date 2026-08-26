@@ -1020,3 +1020,93 @@ original plan. Also worth committing again once training/evaluation
 produce real final numbers, and keeping an eye on disk space going
 forward -- this project's datasets are large enough that redundant
 archives add up fast.
+
+---
+
+## 2026-08-26 — Training finished at 30 epochs; real eval revealed a
+threshold problem, not a dead model; extended to 60 epochs
+
+**Training finished**: 30/30 epochs, best val_dice=0.0233 at epoch 27,
+final-epoch checkpoint also saved. `scripts/evaluate_test_set.py` (built
+and smoke-tested last session) ran for real against all 450 held-out
+Part III images.
+
+**First real result looked bad, then turned out to be a threshold
+problem**: at the training-time default threshold (0.5), mean IoU on the
+1072 tiles that actually contain real oil was **0.0110** -- essentially
+zero overlap -- while the "OVERALL" aggregate showed 0.6544, entirely
+because the no_oil/lookalike classes are trivially easy to get right
+(their ground truth is genuinely empty, so predicting empty scores well
+there regardless of whether the model learned anything about oil).
+Rendered the real detection overlay (`scripts/render_detection_overlay.py`,
+updated to use the real checkpoint and a genuinely held-out Part III demo
+image instead of Part I) and it visually confirmed this: the model
+predicted a completely empty mask on a real oil tile.
+
+**Diagnosed rather than assumed dead**: checked raw sigmoid probabilities
+directly. Max probability anywhere on the demo tile was 0.40 -- never
+crosses 0.5, so threshold=0.5 predicts empty on literally every tile,
+always, regardless of content. But mean probability *inside* the real
+oil region (0.22) was measurably higher than *outside* it (0.17) -- a
+real, if weak, learned signal existed underneath the threshold. Added
+`predict_probs()` to `src/detection/inference.py` (raw sigmoid output,
+`predict_mask()` now built on top of it) and reworked
+`scripts/evaluate_test_set.py` to sweep 6 thresholds from one forward
+pass per tile (no extra GPU cost over a single threshold) rather than
+evaluating at a hardcoded 0.5.
+
+**Real threshold-sweep result** (all 450 images):
+
+| threshold | overall IoU | oil-tiles-only IoU | no_oil IoU | lookalike IoU |
+|---|---|---|---|---|
+| 0.5 | 0.6544 | 0.0110 | 0.8462 | 0.7179 |
+| 0.35 | 0.3352 | 0.0449 | 0.5400 | 0.2913 |
+| 0.25 | 0.1333 | 0.0947 | 0.2621 | 0.0808 |
+| 0.22 | 0.1170 | 0.1158 | 0.2275 | 0.0608 |
+| 0.20 | 0.0984 | 0.1356 | 0.1692 | 0.0546 |
+| 0.18 | 0.0881 | **0.1645** | 0.1283 | 0.0517 |
+
+Honest conclusion: no single threshold fixes an undertrained model --
+lowering it trades oil-detection IoU against no_oil/lookalike false
+positives, and even the best real oil-tiles-only IoU (0.1645 at
+threshold=0.18) is still low in absolute terms. Training loss was still
+decreasing at epoch 30 with no sign of plateauing, so this reads as
+genuinely undertrained rather than architecturally incapable.
+
+**Decision, with the user**: extend training rather than stop on this
+result or just re-threshold and call it done -- asked the user directly
+rather than deciding unilaterally, given it's another several hours of
+compute. Bumped `EPOCHS` in `scripts/train_detection.py` from 30 to 60.
+
+**Real bug hit using the resume-from-checkpoint support added earlier
+this project**: the run that had just finished was launched *before*
+that resume code was added to `src/detection/train.py`, so (as
+documented at the time) it never wrote a `latest_unet_resnet18.pt` --
+resuming would have silently restarted from epoch 1, discarding all 30
+epochs. Reconstructed one manually from `final_unet_resnet18.pt` (model +
+optimizer state, real) plus the full 30-epoch history transcribed from
+the actual training log (loss/time/vram/val_loss/val_dice per epoch,
+real numbers, not estimated) and `best_val_dice=0.0233`/`best_epoch=27`.
+Verified it loads correctly (model + optimizer state_dict) before
+trusting it.
+
+Hit one more real bug getting the resumed run started: the reconstructed
+checkpoint's `scaler_state_dict` was `None` (no real AMP scaler state
+existed to reconstruct), but `train()`'s resume check was
+`if use_amp and "scaler_state_dict" in ckpt` -- true even when the value
+is `None`, since the key exists -- causing `GradScaler.load_state_dict(None)`
+to crash with `TypeError: object of type 'NoneType' has no len()`. Fixed
+to `if use_amp and ckpt.get("scaler_state_dict")`, which is also just a
+more correct check in general (handles any checkpoint missing real
+scaler state, not only this reconstructed one). Relaunched, confirmed
+via the real startup log: `"Resumed from ...: continuing at epoch
+31/60 (best_val_dice=0.0233 at epoch 27)"` -- correct, no lost progress.
+
+**Next session should:** watch the extended run (epochs 31-60) for real
+signs of improvement in oil-tiles-only IoU, not just the misleading
+overall aggregate -- re-run `scripts/evaluate_test_set.py`'s threshold
+sweep once it finishes or spans into a new session. If oil-tiles-only
+IoU is still weak by ~epoch 45-50, worth reconsidering pos_weight or
+loss formulation rather than just running to epoch 60. Once a
+genuinely-improved checkpoint exists, re-run
+`scripts/render_detection_overlay.py` and rebuild the dashboard.

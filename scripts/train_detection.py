@@ -36,7 +36,10 @@ CHECKPOINT_DIR = REPO_ROOT / "data" / "processed" / "checkpoints"
 
 TILE_SIZE = 512
 POS_WEIGHT = 32.6  # real empirical value from scripts/compute_mask_class_balance.py
-EPOCHS = 30
+EPOCHS = 60  # extended from 30 after the real held-out eval showed the model was still
+             # improving (training loss hadn't plateaued) and genuinely undertrained --
+             # see LOG.md "threshold sweep" entry. Resumes from epoch 31 automatically
+             # via latest_checkpoint_path, not a restart from scratch.
 CANDIDATE_BATCH_SIZES = [16, 8, 4]  # tried in order; first one that doesn't OOM on a real batch is used
 NUM_WORKERS = 6  # parallel tile reads (rasterio) -- epoch 1 at num_workers=0 was disk-I/O-bound,
                   # not GPU-bound (93min/epoch vs. ~64min of pure compute time from the batch probe)

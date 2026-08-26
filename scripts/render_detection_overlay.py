@@ -1,10 +1,11 @@
 """
 Renders a real SAR tile / ground-truth mask / predicted mask comparison,
-using the Step 1 sanity checkpoint (src/detection/inference.py explains
-why that checkpoint, not a real trained model, is used here). Picks a
-real Zenodo Part I image with a decent amount of real oil and a
-512x512 window that actually contains it, so the demo isn't just blank
-water.
+using the real trained checkpoint (best_unet_resnet18.pt, from
+scripts/train_detection.py -- see LOG.md for its real val_dice and which
+epoch). Picks a real Zenodo Part III image (the held-out test set, never
+touched during training) with a decent amount of real oil and a 512x512
+window that actually contains it, so the demo isn't just blank water and
+isn't an image the model may have already seen during training.
 
 Output: data/processed/dashboard/detection_overlay.png
 
@@ -27,9 +28,9 @@ from detection.inference import load_model_for_inference, predict_mask  # noqa: 
 from detection.preprocess import lee_filter, normalize_db_fixed  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-IMG_DIR = REPO_ROOT / "data" / "raw" / "zenodo_sar_oil_spill" / "images_extracted" / "Oil"
-MASK_DIR = REPO_ROOT / "data" / "raw" / "zenodo_sar_oil_spill" / "masks_extracted" / "Mask_oil"
-CHECKPOINT_PATH = REPO_ROOT / "data" / "processed" / "checkpoints" / "sanity_unet_resnet18.pt"
+IMG_DIR = REPO_ROOT / "data" / "raw" / "zenodo_sar_oil_spill_part3" / "images_extracted" / "Images" / "Oil"
+MASK_DIR = REPO_ROOT / "data" / "raw" / "zenodo_sar_oil_spill_part3" / "masks_extracted" / "Mask" / "Oil"
+CHECKPOINT_PATH = REPO_ROOT / "data" / "processed" / "checkpoints" / "best_unet_resnet18.pt"
 OUT_PATH = REPO_ROOT / "data" / "processed" / "dashboard" / "detection_overlay.png"
 
 TILE_SIZE = 512
@@ -37,7 +38,10 @@ MIN_OIL_FRACTION = 0.05  # pick an image with at least 5% oil for a meaningful d
 
 
 def find_demo_image() -> tuple[Path, Path, Window]:
-    """Scans a handful of masks, picks one with enough oil, and a tile window covering it."""
+    """Scans a handful of Part III (held-out test set) masks, picks one
+    with enough oil, and a tile window covering it. Mask filenames carry
+    a "_segmentation" suffix the images don't (see
+    scripts/evaluate_test_set.py, which hit this as a real bug first)."""
     for mask_path in sorted(MASK_DIR.glob("*.tif"))[:200]:
         with rasterio.open(mask_path) as src:
             mask = src.read(1)
@@ -49,7 +53,8 @@ def find_demo_image() -> tuple[Path, Path, Window]:
         h, w = mask.shape
         y0 = min(max(cy - TILE_SIZE // 2, 0), h - TILE_SIZE)
         x0 = min(max(cx - TILE_SIZE // 2, 0), w - TILE_SIZE)
-        image_path = IMG_DIR / mask_path.name
+        image_name = mask_path.name.replace("_segmentation", "")
+        image_path = IMG_DIR / image_name
         if image_path.exists():
             return image_path, mask_path, Window(x0, y0, TILE_SIZE, TILE_SIZE)
     raise RuntimeError(f"No image with oil fraction >= {MIN_OIL_FRACTION} found in the first 200 masks scanned.")
@@ -57,7 +62,7 @@ def find_demo_image() -> tuple[Path, Path, Window]:
 
 def main() -> None:
     if not CHECKPOINT_PATH.exists():
-        print(f"ERROR: {CHECKPOINT_PATH} not found. Run scripts/sanity_train.py first (Step 1).")
+        print(f"ERROR: {CHECKPOINT_PATH} not found. Run scripts/train_detection.py first.")
         sys.exit(1)
 
     image_path, mask_path, window = find_demo_image()
@@ -95,7 +100,7 @@ def main() -> None:
 
     axes[2].imshow(despeckled_display, cmap="gray")
     axes[2].imshow(pred_tile, cmap="Wistia", alpha=0.55 * (pred_tile > 0))
-    axes[2].set_title("Model prediction (Step 1 sanity checkpoint --\nNOT a trained model, see DECISIONS.md)", color=amber, fontsize=12)
+    axes[2].set_title("Model prediction (real trained checkpoint,\nheld-out Part III test image, see LOG.md)", color=amber, fontsize=12)
     axes[2].axis("off")
 
     plt.tight_layout(rect=(0, 0, 1, 0.94))
@@ -107,8 +112,7 @@ def main() -> None:
         (gt_tile.astype(bool) & pred_tile.astype(bool)).sum()
         / max((gt_tile.astype(bool) | pred_tile.astype(bool)).sum(), 1)
     )
-    print(f"IoU vs. ground truth on this tile: {iou:.4f} "
-          f"(expected to be poor -- this checkpoint was never trained on real Zenodo data)")
+    print(f"IoU vs. ground truth on this tile (real trained model, held-out test image): {iou:.4f}")
 
 
 if __name__ == "__main__":

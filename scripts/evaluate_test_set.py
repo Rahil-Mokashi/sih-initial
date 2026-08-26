@@ -33,7 +33,7 @@ import torch
 from rasterio.windows import Window
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from detection.inference import load_model_for_inference, predict_mask  # noqa: E402
+from detection.inference import load_model_for_inference, predict_probs  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PART3_DIR = REPO_ROOT / "data" / "raw" / "zenodo_sar_oil_spill_part3"
@@ -50,12 +50,18 @@ CLASS_DIRS = {
 }
 
 
-def tile_metrics(pred: np.ndarray, gt: np.ndarray) -> tuple[float, float, bool]:
-    """Returns (iou, dice, has_oil) for one tile. IoU/Dice defined as 1.0
-    when both pred and gt are empty (correct rejection), not NaN/0 --
-    otherwise a majority-empty test set would understate real performance
-    on the no-oil/lookalike classes, which are SUPPOSED to predict empty."""
-    pred_b, gt_b = pred > 0.5, gt > 0
+THRESHOLDS = [0.5, 0.35, 0.25, 0.22, 0.2, 0.18]  # swept from one forward pass per tile -- see
+# src/detection/inference.py's predict_probs() docstring for why: this project's real
+# checkpoint never crosses 0.5 anywhere on a real test tile despite carrying real signal.
+
+
+def tile_metrics(probs: np.ndarray, gt: np.ndarray, threshold: float) -> tuple[float, float, bool]:
+    """Returns (iou, dice, has_oil) for one tile at one threshold. IoU/Dice
+    defined as 1.0 when both pred and gt are empty (correct rejection), not
+    NaN/0 -- otherwise a majority-empty test set would understate real
+    performance on the no-oil/lookalike classes, which are SUPPOSED to
+    predict empty."""
+    pred_b, gt_b = probs > threshold, gt > 0
     intersection = np.logical_and(pred_b, gt_b).sum()
     union = np.logical_or(pred_b, gt_b).sum()
     has_oil = bool(gt_b.any())
@@ -67,6 +73,10 @@ def tile_metrics(pred: np.ndarray, gt: np.ndarray) -> tuple[float, float, bool]:
 
 
 def evaluate_image(model, device, image_path: Path, mask_path: Path) -> list[dict]:
+    """One real forward pass per tile; metrics computed at every threshold
+    in THRESHOLDS from the same probability map, so a multi-threshold
+    sweep costs no extra GPU inference over evaluating at a single fixed
+    threshold."""
     results = []
     with rasterio.open(image_path) as img_src, rasterio.open(mask_path) as mask_src:
         h, w = img_src.height, img_src.width
@@ -75,9 +85,13 @@ def evaluate_image(model, device, image_path: Path, mask_path: Path) -> list[dic
                 window = Window(x, y, TILE_SIZE, TILE_SIZE)
                 image_tile = img_src.read(1, window=window).astype(np.float32)
                 gt_tile = mask_src.read(1, window=window).astype(np.float32)
-                pred_tile = predict_mask(model, image_tile, device)
-                iou, dice, has_oil = tile_metrics(pred_tile, gt_tile)
-                results.append({"iou": iou, "dice": dice, "has_oil": has_oil})
+                probs = predict_probs(model, image_tile, device)
+                has_oil = bool((gt_tile > 0).any())
+                per_threshold = {}
+                for t in THRESHOLDS:
+                    iou, dice, _ = tile_metrics(probs, gt_tile, t)
+                    per_threshold[t] = {"iou": iou, "dice": dice}
+                results.append({"has_oil": has_oil, "per_threshold": per_threshold})
     return results
 
 
@@ -119,32 +133,37 @@ def main() -> None:
                 print(f"  {i + 1}/{len(images)} images done")
         all_results[label] = class_results
 
-    summary = {"checkpoint": str(args.checkpoint), "tile_size": TILE_SIZE, "per_class": {}}
-    overall_iou, overall_dice = [], []
-    print("\n=== results ===")
-    for label, results in all_results.items():
-        ious = [r["iou"] for r in results]
-        dices = [r["dice"] for r in results]
-        oil_results = [r for r in results if r["has_oil"]]
-        oil_ious = [r["iou"] for r in oil_results]
-        summary["per_class"][label] = {
-            "n_tiles": len(results),
-            "mean_iou": float(np.mean(ious)) if ious else None,
-            "mean_dice": float(np.mean(dices)) if dices else None,
-            "n_tiles_with_oil": len(oil_results),
-            "mean_iou_oil_tiles_only": float(np.mean(oil_ious)) if oil_ious else None,
-        }
-        print(f"{label}: {len(results)} tiles, mean IoU={np.mean(ious):.4f}, mean Dice={np.mean(dices):.4f} "
-              f"({len(oil_results)} tiles actually contain oil, mean IoU on those={np.mean(oil_ious) if oil_ious else float('nan'):.4f})")
-        overall_iou.extend(ious)
-        overall_dice.extend(dices)
+    # The headline number is mean_iou_oil_tiles_only, not the overall mean --
+    # the overall mean is dominated by trivially-easy "correctly predict
+    # empty" tiles from the no_oil/lookalike classes and can look good even
+    # when the model is failing at the actual oil-segmentation task (this
+    # happened for real at threshold=0.5 -- see LOG.md).
+    all_tiles = [r for results in all_results.values() for r in results]
+    oil_tiles = [r for r in all_tiles if r["has_oil"]]
 
-    summary["overall"] = {
-        "n_tiles": len(overall_iou),
-        "mean_iou": float(np.mean(overall_iou)),
-        "mean_dice": float(np.mean(overall_dice)),
-    }
-    print(f"\nOVERALL: {len(overall_iou)} tiles, mean IoU={np.mean(overall_iou):.4f}, mean Dice={np.mean(overall_dice):.4f}")
+    summary = {"checkpoint": str(args.checkpoint), "tile_size": TILE_SIZE, "per_threshold": {}}
+    print("\n=== threshold sweep (mean IoU) ===")
+    print(f"{'threshold':>10} {'overall':>10} {'oil-tiles-only':>16} {'no_oil':>10} {'lookalike':>12}")
+    for t in THRESHOLDS:
+        overall_iou = [r["per_threshold"][t]["iou"] for r in all_tiles]
+        oil_iou = [r["per_threshold"][t]["iou"] for r in oil_tiles]
+        per_class_iou = {
+            label: [r["per_threshold"][t]["iou"] for r in results]
+            for label, results in all_results.items()
+        }
+        summary["per_threshold"][t] = {
+            "overall_mean_iou": float(np.mean(overall_iou)),
+            "oil_tiles_only_mean_iou": float(np.mean(oil_iou)) if oil_iou else None,
+            "per_class_mean_iou": {k: float(np.mean(v)) for k, v in per_class_iou.items()},
+        }
+        print(f"{t:>10} {np.mean(overall_iou):>10.4f} {np.mean(oil_iou) if oil_iou else float('nan'):>16.4f} "
+              f"{np.mean(per_class_iou['no_oil']):>10.4f} {np.mean(per_class_iou['lookalike']):>12.4f}")
+
+    best_t = max(THRESHOLDS, key=lambda t: summary["per_threshold"][t]["oil_tiles_only_mean_iou"] or 0)
+    summary["best_threshold_by_oil_iou"] = best_t
+    print(f"\nbest threshold by oil-tiles-only IoU: {best_t} "
+          f"(oil IoU={summary['per_threshold'][best_t]['oil_tiles_only_mean_iou']:.4f}, "
+          f"overall IoU={summary['per_threshold'][best_t]['overall_mean_iou']:.4f})")
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUT_PATH.write_text(json.dumps(summary, indent=2))

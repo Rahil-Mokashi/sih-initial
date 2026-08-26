@@ -7,3 +7,4 @@ __pycache__/
 # raw/processed data is large and reproducible from the scripts in /scripts
 data/raw/
 data/processed/
+train_stderr.log

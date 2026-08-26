@@ -108,7 +108,7 @@ def train(
         ckpt = torch.load(latest_checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if use_amp and "scaler_state_dict" in ckpt:
+        if use_amp and ckpt.get("scaler_state_dict"):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         result.best_val_dice = ckpt.get("best_val_dice")
