@@ -985,6 +985,29 @@ number rather than figuring it out cold once training finishes.
   deliberately, not the training GPU, so the smoke test wouldn't
   compete with the live training run.
 
+**Update, same session -- committed everything, then a real disk-space
+emergency:** committed the full session's work locally (48 files,
+~22.5k insertions -- detection training pipeline, drift/attribution/
+dashboard build-out, download infra hardening; not pushed to origin,
+that wasn't asked for). Also refreshed README.md, which had gone stale
+(claimed "no Ekman deflection yet" and "NCEP/NCAR down", both fixed
+earlier this project) -- now reflects the real current state and points
+at LOG.md for anything that might lag.
+
+Shortly after, the user reported the disk nearly full. Checked: **9.8GB
+free of 224GB (96% used)**. Cause: `zenodo_sar_oil_spill_part2` (102GB)
+and `_part3` (25GB) each still held their original `.7z` archives
+*alongside* the already-extracted, already-verified image/mask data --
+Part I had its archives deleted after verified extraction (see the "Full
+Zenodo dataset download complete" entry, much earlier this project), but
+that same cleanup step was never applied to Part II/III once their
+extraction was verified this session. Deleted the redundant archives
+(Lookalike images/masks, No_Oil images/masks, Part III combined --
+~55.8GB) now that both are independently verified extracted with correct
+per-class tif counts. **Freed disk from 9.8GB to 62GB available.**
+Training unaffected throughout (it only touches the checkpoints
+directory, never the raw archives).
+
 **Next session should:** continue watching the `num_workers=6` training
 run (real final numbers -- best val_dice, epoch, total wall-clock time --
 once it completes or spans into a new session), then run
@@ -993,4 +1016,7 @@ once it completes or spans into a new session), then run
 `scripts/render_detection_overlay.py` against the real trained checkpoint
 to replace the sanity-checkpoint placeholder in the dashboard's detection
 panel. UI-wise, only the report/PDF export item remains from the
-original plan.
+original plan. Also worth committing again once training/evaluation
+produce real final numbers, and keeping an eye on disk space going
+forward -- this project's datasets are large enough that redundant
+archives add up fast.
