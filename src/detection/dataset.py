@@ -1,0 +1,156 @@
+"""
+PyTorch Dataset classes for tiled SAR image/mask segmentation training.
+
+Two datasets here, for two different purposes -- see DECISIONS.md:
+  - `SARTileDataset`: the Step 1 sanity-check dataset. Precomputes all
+    tiles in memory (fine at the tiny scale it was used at: a handful of
+    640x640 PANGAEA quicklooks with bbox-rasterized pseudo-masks). Not
+    used for real training -- kept for the sanity-pass script.
+  - `ZenodoTileDataset`: the real training dataset, over the full Part I
+    (1200 oil-positive) + Part II (685 no-oil + 685 look-alike) Zenodo
+    images -- real calibrated Sigma0-dB GeoTIFFs with real pixel-accurate
+    masks. Reads tiles as windowed disk reads rather than precomputing,
+    since the full set doesn't fit in memory.
+"""
+
+from __future__ import annotations
+
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import rasterio
+import torch
+from rasterio.windows import Window
+from torch.utils.data import Dataset
+
+from detection.augment import augment_pair
+from detection.preprocess import lee_filter, normalize_db_fixed, tile_image
+
+
+def bbox_to_mask(xml_path: str | Path, image_shape: tuple[int, int]) -> np.ndarray:
+    """Rasterize all <object><bndbox> boxes in a Pascal-VOC-style XML into a binary mask."""
+    tree = ET.parse(xml_path)
+    mask = np.zeros(image_shape, dtype=np.float32)
+    for obj in tree.findall("object"):
+        box = obj.find("bndbox")
+        xmin = int(float(box.find("xmin").text))
+        ymin = int(float(box.find("ymin").text))
+        xmax = int(float(box.find("xmax").text))
+        ymax = int(float(box.find("ymax").text))
+        mask[ymin:ymax, xmin:xmax] = 1.0
+    return mask
+
+
+def normalize_image(image: np.ndarray) -> np.ndarray:
+    """Min-max normalize a despeckled image to [0, 1] for the network input."""
+    lo, hi = float(image.min()), float(image.max())
+    if hi - lo < 1e-6:
+        return np.zeros_like(image, dtype=np.float32)
+    return ((image - lo) / (hi - lo)).astype(np.float32)
+
+
+class SARTileDataset(Dataset):
+    """
+    Tiles a list of (image, mask) array pairs into fixed-size patches and
+    serves them as (1, tile, tile) float tensors. Tiling is precomputed at
+    init since the current sample count is tiny.
+    """
+
+    def __init__(self, pairs: list[tuple[np.ndarray, np.ndarray]], tile_size: int = 256, stride: int | None = None):
+        self.tile_size = tile_size
+        self.tiles: list[tuple[np.ndarray, np.ndarray]] = []
+        for image, mask in pairs:
+            if image.shape != mask.shape:
+                raise ValueError(f"image/mask shape mismatch: {image.shape} vs {mask.shape}")
+            despeckled = lee_filter(image)
+            image_tiles = tile_image(despeckled, tile_size=tile_size, stride=stride)
+            mask_tiles = tile_image(mask, tile_size=tile_size, stride=stride)
+            for img_tile, mask_tile in zip(image_tiles, mask_tiles):
+                self.tiles.append((normalize_image(img_tile), mask_tile))
+
+    def __len__(self) -> int:
+        return len(self.tiles)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        image, mask = self.tiles[idx]
+        image_t = torch.from_numpy(image).unsqueeze(0).float()
+        mask_t = torch.from_numpy(mask).unsqueeze(0).float()
+        return image_t, mask_t
+
+
+@dataclass
+class ImageMaskPair:
+    image_path: Path
+    mask_path: Path
+    label: str  # "oil" | "no_oil" | "lookalike" -- source category, for stratified splitting
+
+
+class ZenodoTileDataset(Dataset):
+    """
+    Real training dataset over the full Part I + Part II Zenodo images
+    (2048x2048 calibrated Sigma0-dB GeoTIFFs). Unlike SARTileDataset above,
+    this does NOT precompute/hold all tiles in memory -- with 2500+
+    source images at 2048x2048, that's tens of GB. Instead it builds a
+    lightweight index of (pair_idx, row, col) tile coordinates up front and
+    reads each tile as a windowed read directly off disk via rasterio when
+    requested, so memory use stays bounded regardless of dataset size.
+
+    Despeckling (Lee filter) is applied per-tile rather than on the full
+    image before cropping -- avoids loading the full 2048x2048 array just
+    to filter it, and the Lee filter's window (7px default) is tiny
+    relative to a 512px tile so the edge-of-tile approximation error is
+    negligible.
+    """
+
+    def __init__(
+        self,
+        pairs: list[ImageMaskPair],
+        tile_size: int = 512,
+        stride: int | None = None,
+        augment: bool = False,
+        seed: int = 0,
+    ):
+        self.tile_size = tile_size
+        self.stride = stride or tile_size
+        self.augment = augment
+        self.rng = np.random.default_rng(seed)
+        self.pairs = pairs
+
+        self.index: list[tuple[int, int, int]] = []  # (pair_idx, row_off, col_off)
+        for i, pair in enumerate(pairs):
+            with rasterio.open(pair.image_path) as src:
+                h, w = src.height, src.width
+            for y in range(0, h - tile_size + 1, self.stride):
+                for x in range(0, w - tile_size + 1, self.stride):
+                    self.index.append((i, y, x))
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        pair_idx, y, x = self.index[idx]
+        pair = self.pairs[pair_idx]
+        window = Window(x, y, self.tile_size, self.tile_size)
+
+        with rasterio.open(pair.image_path) as src:
+            image = src.read(1, window=window).astype(np.float32)
+        with rasterio.open(pair.mask_path) as src:
+            mask = src.read(1, window=window).astype(np.float32)
+
+        image = lee_filter(image)
+
+        # Augment (flips/rotation/dB-scale speckle jitter) BEFORE normalizing:
+        # the speckle jitter's std is calibrated in real dB units, so it must
+        # be applied while the image is still in dB, not after normalize_db_fixed
+        # has compressed the ~50dB range down to [0, 1] (applying it after would
+        # inject ~50x too much noise relative to what the std was tuned for).
+        if self.augment:
+            image, mask = augment_pair(image, mask, self.rng)
+
+        image = normalize_db_fixed(image)
+
+        image_t = torch.from_numpy(image).unsqueeze(0).float()
+        mask_t = torch.from_numpy(mask).unsqueeze(0).float()
+        return image_t, mask_t

@@ -19,3 +19,8 @@ xarray            # wind/current NetCDF (ERA5, ocean currents)
 netCDF4            # xarray's NetCDF backend
 geopandas          # AIS points, vessel tracks, spatial joins
 py7zr              # extract the .7z archives the Zenodo SAR dataset ships as
+segmentation-models-pytorch  # U-Net / DeepLabV3+ with pretrained encoders (pulls in timm)
+python-dotenv      # loads secrets (API keys) from a local .env file, see DECISIONS.md
+cdsapi              # ERA5 wind data via the Copernicus Climate Data Store, see DECISIONS.md
+folium              # real Leaflet map for the dashboard (src/dashboard/build_map.py)
+pytest              # test suite, see tests/

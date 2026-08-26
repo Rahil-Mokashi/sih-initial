@@ -15,25 +15,23 @@ There is no smaller "preview" or per-file listing available from Zenodo for
 this dataset.
 
 So this script does the honest thing instead of pretending to sample:
-  - SAMPLE_MODE (default): downloads the small masks archive in full (~6MB,
-    all 1200 masks — genuinely small) so you can inspect ground-truth
-    structure/format, and downloads only the FIRST `SAMPLE_BYTES` of the
-    images archive as a truncated .7z (useful for confirming the endpoint
-    is reachable and for eyeballing header bytes) but note: a truncated .7z
-    generally CANNOT be extracted -- see NOTE below.
-  - FULL_DOWNLOAD = True: downloads both files in full (~40GB total,
-    will take a long time and a lot of disk).
-
-NOTE on getting real sample *images* to test the preprocessing pipeline
-right now, without the 40GB wait: use one of the small sample images we
-already saved to data/raw/manual_samples/ (see docs/DECISIONS.md, Step 0
-entry) or wait for the full download. This script alone cannot produce a
-handful of extractable real images from this dataset.
-
-To pull the FULL dataset later, flip FULL_DOWNLOAD to True below.
+  - FULL_DOWNLOAD = True (current default, as of Step 2 -- the sanity
+    training pass in Step 1 proved the pipeline works, so we committed to
+    the real download): downloads the masks archive (~6MB) and the full
+    images archive (~38GB) with resumable, progress-reporting download
+    (prints % complete / speed / ETA every ~10s; safe to interrupt and
+    re-run -- it resumes via HTTP Range from wherever the .part file left
+    off, with a fallback to restart if the server doesn't honor the resume
+    request).
+  - FULL_DOWNLOAD = False: downloads the masks in full (still small) and
+    only a truncated 20MB connectivity-test peek of the images archive,
+    which is NOT extractable (the 7z index lives at the end of the file)
+    -- this was the Step 0 default, useful only for confirming the
+    endpoint is reachable before committing to the full download.
 """
 
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -42,10 +40,12 @@ ZENODO_RECORD_ID = "8346860"
 ZENODO_API_URL = f"https://zenodo.org/api/records/{ZENODO_RECORD_ID}"
 
 # --- flip this to True to download both files in full (~40GB) ---
-FULL_DOWNLOAD = False
-SAMPLE_BYTES = 20 * 1024 * 1024  # 20MB truncated peek of the images archive
+FULL_DOWNLOAD = True
+SAMPLE_BYTES = 20 * 1024 * 1024  # 20MB truncated peek of the images archive (only used when FULL_DOWNLOAD is False)
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "raw" / "zenodo_sar_oil_spill"
+
+PROGRESS_INTERVAL_SEC = 10  # how often to print a progress line during a full download
 
 
 def fetch_record_metadata() -> dict:
@@ -54,20 +54,63 @@ def fetch_record_metadata() -> dict:
     return resp.json()
 
 
+def _format_eta(seconds: float) -> str:
+    if seconds != seconds or seconds in (float("inf"), float("-inf")):  # NaN/inf guard
+        return "unknown"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
+
+
 def download_full(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         print(f"  already have {dest.name}, skipping")
         return
-    print(f"  downloading {dest.name} in full...")
-    with requests.get(url, stream=True, timeout=60) as r:
+
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    resume_from = tmp.stat().st_size if tmp.exists() else 0
+    headers = {"Range": f"bytes={resume_from}-"} if resume_from else {}
+    mode = "ab" if resume_from else "wb"
+    if resume_from:
+        print(f"  resuming {dest.name} from {resume_from / (1024**3):.2f} GB...")
+    else:
+        print(f"  downloading {dest.name} in full...")
+
+    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
         r.raise_for_status()
-        tmp = dest.with_suffix(dest.suffix + ".part")
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
+        if resume_from and r.status_code != 206:
+            print("  WARNING: server did not honor the resume request (no 206 Partial Content) -- "
+                  "restarting this file from scratch to avoid corrupting it.")
+            resume_from = 0
+            mode = "wb"
+        total_size = resume_from + int(r.headers.get("Content-Length", 0))
+        downloaded = resume_from
+        start = time.perf_counter()
+        last_print = start
+
+        with open(tmp, mode) as f:
+            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
                 f.write(chunk)
+                downloaded += len(chunk)
+
+                now = time.perf_counter()
+                if now - last_print >= PROGRESS_INTERVAL_SEC:
+                    elapsed = now - start
+                    speed_mbps = (downloaded - resume_from) / elapsed / (1024 ** 2) if elapsed > 0 else 0
+                    pct = downloaded / total_size * 100 if total_size else 0
+                    remaining_bytes = total_size - downloaded
+                    eta = remaining_bytes / (speed_mbps * 1024 ** 2) if speed_mbps > 0 else float("nan")
+                    print(
+                        f"  {downloaded / (1024**3):.2f} / {total_size / (1024**3):.2f} GB "
+                        f"({pct:.1f}%)  {speed_mbps:.1f} MB/s  ETA {_format_eta(eta)}",
+                        flush=True,
+                    )
+                    last_print = now
+
         tmp.rename(dest)
-    print(f"  done: {dest}")
+    print(f"  done: {dest} ({dest.stat().st_size / (1024**3):.2f} GB)")
 
 
 def download_partial(url: str, dest: Path, n_bytes: int) -> None:

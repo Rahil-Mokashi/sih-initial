@@ -93,6 +93,20 @@ def lee_filter(image: np.ndarray, window_size: int = 7) -> np.ndarray:
     return mean + k * (image - mean)
 
 
+def normalize_db_fixed(image: np.ndarray, lo: float = EXPECTED_DB_RANGE[0], hi: float = EXPECTED_DB_RANGE[1]) -> np.ndarray:
+    """
+    Clip to a fixed physically-meaningful dB range and linearly scale to
+    [0, 1]. Deliberately NOT per-tile min-max: for real calibrated Sigma0-dB
+    data, per-tile min-max would rescale each tile's own local range to
+    fill [0, 1] regardless of its absolute backscatter level, which throws
+    away the actual calibration signal the model needs (oil's genuinely
+    lower dB values relative to surrounding water) and makes brightness
+    incomparable between tiles. A fixed dataset-wide range preserves that.
+    """
+    clipped = np.clip(image, lo, hi)
+    return ((clipped - lo) / (hi - lo)).astype(np.float32)
+
+
 def tile_image(image: np.ndarray, tile_size: int = 256, stride: int | None = None) -> list[np.ndarray]:
     """
     Cut `image` into tile_size x tile_size patches. Partial edge tiles are
