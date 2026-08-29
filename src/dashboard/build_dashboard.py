@@ -10,6 +10,13 @@ checkpoint -- see PIPELINE_STATUS below and DECISIONS.md).
 Usage:
     venv\\Scripts\\python.exe src\\dashboard\\build_map.py       # builds map.html / map_{case}.html
     venv\\Scripts\\python.exe src\\dashboard\\build_dashboard.py # builds output/index.html
+
+    Add --anonymize to either command to write to output_anon/ instead,
+    with real ship_name/mmsi/imo replaced by fictional stand-ins ("Vessel
+    A") -- for a deck, recording, or screenshot that may leave the
+    judging room. See src/common/anonymize.py for why. The live
+    output/ build (no flag) keeps real vessel identities and is meant to
+    be shown to judges directly, not shared onward.
 """
 
 from __future__ import annotations
@@ -17,15 +24,17 @@ from __future__ import annotations
 import base64
 import csv
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common.anonymize import anonymize_ranking  # noqa: E402
 from common.geo import haversine_km  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "processed" / "dashboard"
 DETECTION_OVERLAY_PATH = DATA_DIR / "detection_overlay.png"
+DETECTION_GEOMETRY_PATH = DATA_DIR / "detection_geometry.json"
 PROCESSED_DIR = DATA_DIR.parent
 CHECKPOINT_DIR = PROCESSED_DIR / "checkpoints"
 TRAIN_MANIFEST = PROCESSED_DIR / "train_manifest.csv"
@@ -58,7 +67,7 @@ PIPELINE_STATUS = {
         "state": "in_progress",
         "detail": "Real GFW data + a first-pass scoring algorithm (distance + timing vs. the "
                    "drift-estimated origin). Not yet calibrated against any labeled ground "
-                   "truth -- read confidence values as a reasonable first ordering, not a "
+                   "truth -- read match-score values as a reasonable first ordering, not a "
                    "verdict.",
     },
 }
@@ -93,18 +102,33 @@ def render_vessel_cards(ranking: dict) -> str:
             timing_bullet,
             f"AIS present {fmt_short(v['entry_timestamp'])} &rarr; {fmt_short(v['exit_timestamp'])} UTC",
         ]
+        # Behavioral-anomaly evidence (real GFW v3/events AIS-gap check, see
+        # src/attribution/score_vessels.py) -- kept as its own always-visible
+        # bullet, not folded silently into the score, per the SIH problem
+        # statement's ask for a genuinely separate, auditable sub-score.
+        if v.get("ais_gap_count"):
+            intentional = v.get("ais_gap_intentional")
+            flag_note = "GFW-flagged intentional disabling" if intentional else "not flagged as intentional"
+            evidence.append(
+                f'<span class="gap-flag">AIS gap: {v["ais_gap_duration_hours"]:.1f}h, '
+                f'{v["ais_gap_distance_km"]:.0f}km drift while dark ({flag_note})</span>'
+            )
         # Click-to-expand detail: fields real GFW records carry but that
         # would clutter the always-visible card -- IMO, vessel type, raw
-        # hours-present, and the underlying distance+timing score before
-        # it's converted to a confidence percentage.
+        # hours-present, the proximity+timing-only score before behavior is
+        # factored in, and trajectory evidence from this vessel's other real
+        # presence rows in the window (see trajectory_evidence() docstring).
         detail_rows = [
             ("IMO", v["imo"] or "&mdash;"),
             ("Vessel type", (v["vessel_type"] or "unknown").replace("_", " ").title()),
             ("Hours present in window", str(v["hours_present"])),
-            ("Raw score", f"{v['score']:.4f} <span class=\"muted-inline\">(lower = stronger match; distance + timing, see DECISIONS.md)</span>"),
+            ("Proximity+timing score", f"{v['score']:.4f} <span class=\"muted-inline\">(distance + timing only, see DECISIONS.md)</span>"),
+            ("Composite score", f"{v['composite_score']:.4f} <span class=\"muted-inline\">(proximity + timing + AIS-gap behavior; ranking below is sorted by this)</span>"),
+            ("Presence records in window", f"{v['n_presence_records']} <span class=\"muted-inline\">(real GFW rows for this vessel, this case's date range)</span>"),
+            ("Closest approach (any time in window)", f"{v['closest_approach_km']:.2f} km" if v.get("closest_approach_km") is not None else "&mdash;"),
         ]
         cards.append(f"""
-      <div class="vcard{' top' if is_top else ''}" data-distance="{v['distance_km']}" data-timegap="{v['time_gap_hours']}" data-confidence="{v['confidence_pct']}" data-rank="{v['rank']}">
+      <div class="vcard{' top' if is_top else ''}" data-distance="{v['distance_km']}" data-timegap="{v['time_gap_hours']}" data-matchscore="{v['match_score_pct']}" data-rank="{v['rank']}">
         {'<div class="vcard-top-flag">Top Suspect</div>' if is_top else ''}
         <div class="vcard-row vcard-toggle">
           <div style="display:flex;gap:9px;min-width:0;">
@@ -114,9 +138,9 @@ def render_vessel_cards(ranking: dict) -> str:
               <div class="vmeta"><span>MMSI {v['mmsi'] or '-'}</span><span>&middot;</span><span>{v['flag'] or '-'}</span></div>
             </div>
           </div>
-          <div class="confidence-block"><div class="confidence-num">{v['confidence_pct']:.0f}<sup>%</sup></div></div>
+          <div class="matchscore-block"><div class="matchscore-num">{v['match_score_pct']:.0f}<sup>%</sup></div></div>
         </div>
-        <div class="bar-track"><div class="bar-fill" style="width:{v['confidence_pct']:.0f}%;"></div></div>
+        <div class="bar-track"><div class="bar-fill" style="width:{v['match_score_pct']:.0f}%;"></div></div>
         <ul class="evidence">{"".join(f'<li>{e}</li>' for e in evidence)}</ul>
         <div class="vcard-detail">
           {"".join(f'<div class="detail-row"><span>{k}</span><span>{val}</span></div>' for k, val in detail_rows)}
@@ -141,7 +165,7 @@ VESSEL_SORT_SCRIPT = """
         if (key === "rank") return parseFloat(a.dataset.rank) - parseFloat(b.dataset.rank);
         if (key === "distance") return parseFloat(a.dataset.distance) - parseFloat(b.dataset.distance);
         if (key === "timegap") return parseFloat(a.dataset.timegap) - parseFloat(b.dataset.timegap);
-        if (key === "confidence") return parseFloat(b.dataset.confidence) - parseFloat(a.dataset.confidence);
+        if (key === "matchscore") return parseFloat(b.dataset.matchscore) - parseFloat(a.dataset.matchscore);
         return 0;
       });
       cards.forEach(function (c) { list.appendChild(c); });
@@ -159,7 +183,7 @@ def render_stat_strip(data: dict, ranking: dict | None) -> str:
         (datetime.fromisoformat(data["detection_time_utc"]) - timedelta(hours=data["hours_back"])).isoformat()
     )
     n_candidates = ranking["n_candidates"] if ranking else None
-    top_confidence = ranking["ranking"][0]["confidence_pct"] if ranking and ranking["ranking"] else None
+    top_match_score = ranking["ranking"][0]["match_score_pct"] if ranking and ranking["ranking"] else None
 
     src_centroids = {s["name"]: tuple(s["centroid"]) for s in data["sources"]}
     wind_compare_stat = ""
@@ -186,8 +210,8 @@ def render_stat_strip(data: dict, ranking: dict | None) -> str:
         <div class="stat-value">{n_candidates if n_candidates is not None else '&mdash;'}<small>in search area</small></div>
       </div>
       <div class="stat accent">
-        <div class="stat-label">Top Suspect Confidence</div>
-        <div class="stat-value">{f'{top_confidence:.0f}' if top_confidence is not None else '&mdash;'}<small>%</small></div>
+        <div class="stat-label">Top Suspect Match Score</div>
+        <div class="stat-value">{f'{top_match_score:.0f}' if top_match_score is not None else '&mdash;'}<small>%</small></div>
       </div>{wind_compare_stat}
     </section>"""
 
@@ -212,14 +236,15 @@ def render_case_container(case_id: str, index: int, data: dict | None, ranking: 
         <div class="map-panel-head">
           <div>
             <div class="panel-title">Drift Reconstruction &mdash; {case_id}</div>
-            <div class="panel-sub">Backward trace from detection ({data['detection_time_utc']}) to estimated origin, real ERA5/HYCOM data</div>
+            <div class="panel-sub">{data.get('geo_context', '') + ' &middot; ' if data.get('geo_context') else ''}Backward + forward trace from detection ({data['detection_time_utc']}), real ERA5/HYCOM data</div>
           </div>
           {render_status_pill("drift_model")}
         </div>
         <div class="map-stage"><iframe src="{map_file}" title="Drift map for {case_id}" style="width:100%;height:100%;border:0;display:block;"></iframe></div>
         <div class="legend">
           <div class="legend-item"><span class="legend-swatch" style="background:var(--alert);"></span>Detection point</div>
-          <div class="legend-item"><span class="legend-swatch" style="background:var(--amber-bright);"></span>Drift trace &amp; origin estimate</div>
+          <div class="legend-item"><span class="legend-swatch" style="background:var(--amber-bright);"></span>Backward trace (hindcast) &amp; origin estimate</div>
+          <div class="legend-item"><span class="legend-swatch" style="background:repeating-linear-gradient(90deg,var(--amber-bright) 0 4px,transparent 4px 8px);"></span>Forward trace (forecast)</div>
           <div class="legend-item"><span class="legend-swatch" style="background:var(--teal-bright);border-radius:50%;"></span>Candidate vessel</div>
           <div class="legend-item"><span class="legend-swatch" style="background:transparent;border:2px solid var(--amber-bright);border-radius:50%;"></span>Top suspect</div>
         </div>
@@ -232,10 +257,10 @@ def render_case_container(case_id: str, index: int, data: dict | None, ranking: 
               <div class="panel-sub">Top {n_ranked} of {n_total} real GFW candidates &middot; click a card for full evidence</div>
             </div>
             <select class="sort-select">
-              <option value="rank">Sort: confidence rank</option>
+              <option value="rank">Sort: match score rank</option>
               <option value="distance">Sort: distance</option>
               <option value="timegap">Sort: time gap</option>
-              <option value="confidence">Sort: confidence %</option>
+              <option value="matchscore">Sort: match score %</option>
             </select>
           </div>
         </div>
@@ -385,7 +410,7 @@ def render_case_comparison_table(cases: dict[str, tuple[dict | None, dict | None
                     if "ERA5" in centroids and "NCEP/NCAR" in centroids else "&mdash;")
         top = ranking["ranking"][0] if ranking and ranking["ranking"] else None
         top_suspect_cell = (
-            f'{top["ship_name"] or "(unnamed)"} <span class="mono cmp-conf">{top["confidence_pct"]:.0f}%</span>'
+            f'{top["ship_name"] or "(unnamed)"} <span class="mono cmp-match">{top["match_score_pct"]:.0f}%</span>'
             if top else "&mdash;"
         )
         rows.append(f"""
@@ -437,7 +462,44 @@ def render_detection_section() -> str:
       {render_status_pill("detection_model")}
     </div>
     {body}
+    {render_geometry_row()}
   </section>"""
+
+
+def render_geometry_row() -> str:
+    """
+    Real geometric characterization (src/detection/geometry.py) of the
+    demo tile's ground-truth and predicted masks -- area/length/width/
+    orientation/elongation, per the SIH problem statement's "characterise
+    the oil spill and calculate geometric properties" ask. Pixel units
+    only: this dataset's own Zenodo record doesn't document a Sentinel-1
+    product type or ground resolution (checked directly, not assumed --
+    see DECISIONS.md), so no real-world km2/m conversion is applied.
+    """
+    if not DETECTION_GEOMETRY_PATH.exists():
+        return ""
+    geo = json.loads(DETECTION_GEOMETRY_PATH.read_text())
+
+    def stat_cell(label: str, g: dict) -> str:
+        if not g or g.get("area_px", 0) == 0:
+            return f'<div class="geo-cell"><div class="geo-label">{label}</div><div class="geo-empty">no detected pixels</div></div>'
+        return f"""
+        <div class="geo-cell">
+          <div class="geo-label">{label}</div>
+          <div class="geo-row"><span>Area</span><span class="mono">{g['area_px']:,} px ({g['n_components']} component{'s' if g['n_components'] != 1 else ''})</span></div>
+          <div class="geo-row"><span>Length &times; Width</span><span class="mono">{g['length_px']:.0f} &times; {g['width_px']:.0f} px</span></div>
+          <div class="geo-row"><span>Orientation</span><span class="mono">{g['orientation_deg']:.0f}&deg;</span></div>
+          <div class="geo-row"><span>Elongation</span><span class="mono">{g['elongation']:.2f}x</span></div>
+        </div>"""
+
+    return f"""
+    <div class="geo-strip">
+      <div class="geo-note">Real geometric characterization &middot; pixel units only &mdash; this dataset's Sentinel-1 product type/ground resolution isn't documented by its source, so no km&sup2; conversion is assumed (see DECISIONS.md)</div>
+      <div class="geo-cells">
+        {stat_cell("Real ground truth (Zenodo mask)", geo.get("ground_truth"))}
+        {stat_cell("Model prediction", geo.get("prediction"))}
+      </div>
+    </div>"""
 
 
 def build_html(cases: dict[str, tuple[dict | None, dict | None]]) -> str:
@@ -450,6 +512,10 @@ def build_html(cases: dict[str, tuple[dict | None, dict | None]]) -> str:
     )
     case_containers = "".join(
         render_case_container(cid, i, *cases[cid]) for i, cid in enumerate(available)
+    )
+    methodology_note = next(
+        (cases[cid][1]["methodology"]["note"] for cid in available if cases[cid][1]),
+        "First-pass heuristic scoring, not calibrated against labeled ground truth.",
     )
 
     return f"""<!doctype html>
@@ -503,6 +569,19 @@ def build_html(cases: dict[str, tuple[dict | None, dict | None]]) -> str:
   .case-tab.active{{background:var(--amber);border-color:var(--amber);color:#1c1204;}}
   .status-row{{display:flex;gap:8px;padding:10px 24px;background:var(--navy-panel);border:1px solid var(--line-soft);border-radius:10px;flex-wrap:wrap;font-size:12px;}}
   .status-row .label{{color:var(--fog);}}
+  .export-btn{{font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;padding:5px 14px;border-radius:999px;border:1px solid var(--teal-bright);background:transparent;color:var(--teal-bright);cursor:pointer;}}
+  .export-btn:hover{{background:var(--teal-bright);color:#062018;}}
+  .print-header{{display:none;}}
+  @media print {{
+    html, body {{ print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
+    .corner-tag, .case-tabs, .sort-select, .export-btn, .map-panel, footer.note a {{ display: none !important; }}
+    .main-grid {{ grid-template-columns: 1fr; }}
+    .case-container {{ display: block !important; page-break-after: always; }}
+    .vcard-detail {{ display: flex !important; }}
+    .print-header {{ display: block; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--line-strong); }}
+    .print-header h2 {{ font-family: 'Chivo', sans-serif; font-size: 18px; margin: 0 0 4px; }}
+    .print-header p {{ font-size: 11px; color: var(--fog-dim); margin: 2px 0; }}
+  }}
   .status-pill{{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;background:var(--navy-raised);font-size:11px;font-weight:600;color:var(--paper);}}
   .status-pill .dot{{width:7px;height:7px;border-radius:50%;background:var(--pill-color);}}
   .stat-strip{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;}}
@@ -535,10 +614,10 @@ def build_html(cases: dict[str, tuple[dict | None, dict | None]]) -> str:
   .vcard.top .vcard-rank{{color:var(--amber-bright);}}
   .vname{{font-family:'Chivo',system-ui,sans-serif;font-weight:700;font-size:15px;line-height:1.2;}}
   .vmeta{{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--fog-dim);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap;}}
-  .confidence-block{{flex:none;text-align:right;}}
-  .confidence-num{{font-family:'IBM Plex Mono',monospace;font-weight:700;font-size:19px;color:var(--teal-bright);}}
-  .vcard.top .confidence-num{{color:var(--amber-bright);}}
-  .confidence-num sup{{font-size:11px;font-weight:500;color:var(--fog-dim);}}
+  .matchscore-block{{flex:none;text-align:right;}}
+  .matchscore-num{{font-family:'IBM Plex Mono',monospace;font-weight:700;font-size:19px;color:var(--teal-bright);}}
+  .vcard.top .matchscore-num{{color:var(--amber-bright);}}
+  .matchscore-num sup{{font-size:11px;font-weight:500;color:var(--fog-dim);}}
   .bar-track{{margin-top:9px;height:6px;border-radius:4px;background:var(--line-soft);overflow:hidden;}}
   .bar-fill{{height:100%;border-radius:4px;background:linear-gradient(90deg,var(--teal),var(--teal-bright));}}
   .vcard.top .bar-fill{{background:linear-gradient(90deg,var(--amber),var(--amber-bright));}}
@@ -553,6 +632,7 @@ def build_html(cases: dict[str, tuple[dict | None, dict | None]]) -> str:
   .detail-row span:first-child{{color:var(--fog-dim);}}
   .detail-row span:last-child{{color:var(--fog);text-align:right;}}
   .muted-inline{{color:var(--fog-dim);font-size:10.5px;}}
+  .gap-flag{{color:var(--alert);font-weight:600;}}
   .placeholder{{padding:28px 20px;text-align:center;flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;}}
   .placeholder-icon{{font-size:28px;color:var(--fog-dim);}}
   .placeholder-title{{font-weight:700;margin:4px 0 0;font-size:13px;}}
@@ -560,6 +640,14 @@ def build_html(cases: dict[str, tuple[dict | None, dict | None]]) -> str:
   .muted{{color:var(--fog-dim);font-size:12px;padding:16px;}}
   .overlay-img{{width:100%;display:block;padding:10px 20px 20px;box-sizing:border-box;border-radius:8px;}}
   .detection-section{{margin-top:0;}}
+  .geo-strip{{padding:0 20px 18px;}}
+  .geo-note{{font-size:11px;color:var(--fog-dim);margin-bottom:10px;}}
+  .geo-cells{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;}}
+  .geo-cell{{background:var(--navy-app);border:1px solid var(--line-soft);border-radius:8px;padding:10px 12px;}}
+  .geo-label{{font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--fog-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;}}
+  .geo-row{{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;padding:2px 0;}}
+  .geo-row span:first-child{{color:var(--fog);}}
+  .geo-empty{{font-size:12px;color:var(--fog-dim);font-style:italic;}}
   .provenance-panel{{background:var(--navy-panel);border:1px solid var(--line-soft);border-radius:16px;overflow:hidden;box-shadow:var(--shadow-deep);margin-top:0;}}
   .prov-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:1px;background:var(--line-soft);border-top:1px solid var(--line-soft);}}
   .prov-row{{background:var(--navy-panel);padding:14px 18px 16px;display:flex;flex-direction:column;gap:4px;}}
@@ -575,7 +663,7 @@ def build_html(cases: dict[str, tuple[dict | None, dict | None]]) -> str:
   .cmp-row:hover td{{background:var(--navy-raised);}}
   .cmp-row:last-child td{{border-bottom:none;}}
   .cmp-case{{font-family:'Chivo',system-ui,sans-serif;font-weight:700;color:var(--paper);}}
-  .cmp-conf{{color:var(--amber-bright);margin-left:4px;}}
+  .cmp-match{{color:var(--amber-bright);margin-left:4px;}}
   .cmp-table td.mono{{font-family:'IBM Plex Mono',monospace;}}
   .corner-tag{{position:fixed;top:16px;right:16px;z-index:50;display:flex;align-items:center;gap:7px;background:rgba(10,18,28,.88);border:1px solid var(--amber-line);color:var(--amber-bright);font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;padding:7px 12px;border-radius:999px;backdrop-filter:blur(6px);box-shadow:0 10px 24px -10px rgba(0,0,0,.7);}}
   .corner-tag .dot{{width:6px;height:6px;border-radius:50%;background:var(--amber-bright);animation:blink 2.2s ease-in-out infinite;}}
@@ -607,11 +695,18 @@ def build_html(cases: dict[str, tuple[dict | None, dict | None]]) -> str:
     </div>
   </header>
 
+  <div class="print-header">
+    <h2>SIH26143 &mdash; Oil Spill Attribution System &mdash; Case Report</h2>
+    <p>Generated {generated} &middot; real drift + AIS data throughout, non-final detection checkpoint (see DECISIONS.md)</p>
+    <p>Attribution methodology: {methodology_note}</p>
+  </div>
+
   <div class="status-row">
     <span class="label">Detection model:</span> {render_status_pill("detection_model")}
     <span class="label" style="margin-left:12px">Drift model:</span> {render_status_pill("drift_model")}
     <span class="label" style="margin-left:12px">GFW / attribution:</span> {render_status_pill("gfw_attribution")}
     <span class="case-tabs" style="margin-left:auto;"><span class="tabs-label">Case</span>{tabs}</span>
+    <button class="export-btn" onclick="window.print()">Export Report (PDF)</button>
   </div>
 
   {render_case_comparison_table(cases, available)}
@@ -646,21 +741,27 @@ def build_html(cases: dict[str, tuple[dict | None, dict | None]]) -> str:
 
 
 def main() -> None:
+    anonymize = "--anonymize" in sys.argv
+    out_dir = OUT_DIR.parent / "output_anon" if anonymize else OUT_DIR
+    out_path = out_dir / "index.html"
+
     cases = {}
     for case_id in CASE_IDS:
         data_path = DATA_DIR / f"drift_{case_id.replace('-', '')}.json"
         ranking_path = DATA_DIR / f"vessel_ranking_{case_id.replace('-', '')}.json"
         data = json.loads(data_path.read_text()) if data_path.exists() else None
         ranking = json.loads(ranking_path.read_text()) if ranking_path.exists() else None
+        if anonymize:
+            ranking = anonymize_ranking(ranking)
         cases[case_id] = (data, ranking)
         if data is None:
             print(f"NOTE: no drift data for {case_id} ({data_path}).")
         if ranking is None:
             print(f"NOTE: no vessel ranking for {case_id} ({ranking_path}).")
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_PATH.write_text(build_html(cases), encoding="utf-8")
-    print(f"wrote {OUT_PATH}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(build_html(cases), encoding="utf-8")
+    print(f"wrote {out_path}{' (anonymized)' if anonymize else ''}")
 
 
 if __name__ == "__main__":

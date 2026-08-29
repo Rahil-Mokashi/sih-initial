@@ -858,3 +858,467 @@ ever write to the same byte range. Final size and `py7zr` header
 integrity are both checked before the file is renamed into place, so a
 bad download is caught immediately rather than silently reused later
 (as the original corrupted file was).
+
+## 2026-08-26 — "Confidence" relabeled to "match score"; anonymized
+dashboard build added for public-facing use
+
+**"Confidence" was the wrong word.** The attribution score is an
+uncalibrated composite of distance + timing (explicitly documented
+above, "Attribution scoring", as not calibrated against any labeled
+ground truth -- no such dataset exists for this problem). But the
+dashboard displayed it as "97% confidence" / "98% confidence", which
+reads as a calibrated probability of guilt to anyone not reading the
+methodology fine print, including a judge skimming the screen. Relabeled
+everywhere user-facing -- stat tile ("Top Suspect Match Score"), vessel
+cards, sort dropdown, comparison table, map tooltips/popups -- and
+renamed the underlying field itself (`confidence_pct` ->
+`match_score_pct` in `src/attribution/score_vessels.py`'s output, not
+just the display strings) so the code's vocabulary matches what's shown,
+rather than leaving a "confidence" field internally that now displays as
+something else. Existing `vessel_ranking_*.json` files were updated
+in place (key renamed, values untouched) rather than re-querying GFW.
+Same substance, same distance/timing breakdown next to it as before --
+just no implied precision the methodology doesn't back up.
+
+**Real vessel identity is a reputational exposure, not just a technical
+one.** THOR FREYJA and ALAWAD1 (the real top suspects in ow-0001/
+ow-0002) are real, identifiable ships. Naming them as "suspects" in a
+pitch that may get recorded, screenshotted, or shared past the judging
+room is a genuine exposure for a real company's real vessel, even
+though the methodology is explicit that this is a ranked lead and not a
+verdict. Decided with the user to anonymize deliberately rather than let
+it happen by omission: real vessel identity stays in the live dashboard
+shown directly to judges (proof the pipeline runs on real GFW data, not
+a mockup), but anything built for a deck, recording, or screenshot uses
+`--anonymize` (added to `build_dashboard.py` and `build_map.py`, writing
+to `output_anon/` instead of `output/`). `src/common/anonymize.py`
+replaces `ship_name`/`mmsi`/`imo` with fictional stand-ins ("Vessel A",
+"REDACTED") while leaving distance, timing, score, flag, and
+vessel_type real -- those are evidence, not identity. Scoped narrowly to
+the fields the user actually flagged; lon/lat marker positions are left
+real since stripping them would break the map visualization and wasn't
+what was asked.
+
+## 2026-08-26 — Report/PDF export added, closing the UI plan's last item
+
+Asked directly what could honestly be pushed to 100% completion while the
+detection-model loss/pos_weight trials run. The detection model itself
+can't be -- its real accuracy is gated on those trial results, not a
+to-do list Claude can just clear. But the UI plan (see "case comparison
+table" entry above, "5 of 6 done ... only report/PDF export remains")
+had exactly one open item, and it's a real, boundable piece of scope:
+built it rather than leave the last checklist item permanently open.
+
+Kept it a static, client-side export rather than adding a PDF-generation
+dependency (reportlab/weasyprint) the rest of the codebase doesn't use --
+an "Export Report (PDF)" button (`window.print()`) plus a `@media print`
+stylesheet in `build_dashboard.py`: hides interactive-only chrome (sort
+dropdown, case tabs, the corner tag, the button itself), force-expands
+every vessel card's click-to-reveal detail block (a browser can't click
+during print, so the IMO/vessel-type/raw-score evidence would otherwise
+be silently dropped from the PDF), force-shows both case containers
+(normally one is `display:none` for the tab switcher) so the exported
+report covers everything rather than whatever tab happened to be open,
+and drops the map panel (a live Leaflet/OSM iframe needs network tile
+loads at print time, which isn't guaranteed -- the vessel evidence table
+is the report's real content anyway). Added `print-color-adjust: exact`
+so the dark navy/amber/teal theme survives into the PDF instead of
+browsers stripping backgrounds by default. A print-only header (title,
+real generation timestamp, the same "not calibrated against labeled
+ground truth" methodology line already on the live dashboard) makes the
+exported PDF self-contained and exactly as honest as the on-screen
+version -- same substance, no less caveat.
+
+## 2026-08-26 — Tile-level oil-sampling imbalance found and measured;
+weighted sampler added as a third, higher-priority trial
+
+Asked directly whether there was a better lever than the two loss/
+pos_weight trials already running. Rather than guess, checked the
+actual training pipeline end to end (model.py: encoder is already
+ImageNet-pretrained; augment.py: flips/rotation/dB-speckle-jitter are
+already SAR-appropriate -- neither was the gap) and found one:
+`ZenodoTileDataset` tiles every training image into a non-overlapping
+512x512 grid and samples uniformly across all of it, but 685 `no_oil` +
+685 `lookalike` images are 100% oil-free by construction, and most
+tiles even within the 1200 real oil images miss the slick entirely.
+`pos_weight` in `DiceBCELoss` only reweights pixels *inside* a tile that
+already has some oil -- it cannot inject signal into a batch that has
+none.
+
+Measured it for real rather than assuming (`scripts/
+analyze_tile_oil_distribution.py`, reading every real training mask's
+actual tile grid): of 34,940 real training tiles, **82.4% have zero oil
+pixels** (0% within `no_oil`/`lookalike`, and even within `oil`-labeled
+images only 37.7% of their own tiles touch the slick). At batch_size~8,
+that puts roughly 1 in 5 batches at zero oil-learning gradient
+regardless of loss/pos_weight choice -- a signal-sparsity problem
+neither running trial addresses.
+
+Added `compute_oil_tile_weights()` to `src/detection/dataset.py`:
+reads each indexed tile's real mask once, solves for the oil-tile
+weight multiplier that hits a target per-epoch oil-tile representation
+(default 50%) under `WeightedRandomSampler`, kept as a standalone
+function rather than baked into `ZenodoTileDataset` so it stays an
+independently-testable variable -- `train()` gained a `sampler` param
+(replacing `shuffle=True` when given, since DataLoader disallows both),
+and `train_detection.py` gained `--oversample-oil-tiles` /
+`--target-oil-fraction`. Validation is intentionally left unsampled
+(real class distribution) so val_dice stays an honest, unbiased metric.
+
+Reordered the trial queue rather than running all three losing time to
+GPU/disk contention on a single 6GB card: killed the just-started
+Tversky trial (its real epoch-1 result, val_dice=0.0227, kept via its
+saved checkpoint -- not discarded, just deprioritized) and requeued
+oil-tile oversampling (original DiceBCE/pos_weight=32.6, isolating the
+sampling variable alone) first, then Tversky resuming from its real
+epoch-1 checkpoint, then the pos_weight+scheduler trial as originally
+planned.
+
+## 2026-08-27 — Closing the real gaps against the official SIH26143
+problem statement (forward drift, attribution trajectory/behavior,
+geometric characterization)
+
+The user supplied the actual official problem-statement text and asked
+for a line-by-line audit against the real repo (not an assumption-based
+one) before any new work, then to close every real gap found. Full audit
+results were reported back before starting (see that turn); this entry
+covers what was actually built afterward, with real numbers, per the
+audit's five items.
+
+### Forward drift forecasting added
+
+The PS names this twice ("predict the future flow," "backward AND
+forward") and it was a total, confirmed gap: `src/drift/advect.py` had
+only `backward_advect()`. Added `forward_advect()` sharing one physics
+core (`_advect()`, new) with `backward_advect()` via a `direction`
+parameter (-1 backward, +1 forward) -- same windage/current/Ekman
+physics either way, one integration loop to keep correct instead of two
+copies that could silently drift apart. `backward_advect()`'s own
+behavior is bit-for-bit unchanged (direction=-1 reproduces the original
+sign exactly); all 22 pre-existing tests plus the new ones still pass.
+
+Wired into `scripts/export_drift_dashboard_data.py` (`HOURS_FORWARD=24`,
+same window length as `HOURS_BACK` -- a documented symmetric choice, not
+a physical constraint) and run for real on both validated cases, both
+wind sources -- real detection-to-forecast distances:
+
+| case | source | detection&rarr;backward-origin | detection&rarr;forward-forecast |
+|---|---|---|---|
+| ow-0001 | ERA5 | 12.95 km | 12.16 km |
+| ow-0001 | NCEP/NCAR | 10.44 km | 16.30 km |
+| ow-0002 | ERA5 | 31.36 km | 24.56 km |
+| ow-0002 | NCEP/NCAR | 23.21 km | 29.35 km |
+
+Wired into `src/dashboard/build_map.py` as a second, visually distinct
+track layer -- same color per wind source as the backward trace, but
+dashed (`dash_array`) rather than solid, with its own toggleable Leaflet
+layer and popup, plus a forward-arrow marker at the forecast centroid.
+Legend updated (`build_dashboard.py`) to read "Backward trace (hindcast)"
+vs. "Forward trace (forecast)" rather than the previous single "Drift
+trace" label, now that there are two.
+
+### Attribution: trajectory + behavioral-anomaly scoring
+
+**Confirmed via direct code read** (not the user's recollection) that the
+existing `score_vessels()` used only distance+timing, exactly as
+described -- see the audit turn for the file/line citations.
+
+**Real GFW v3/events API test** (`scripts/test_gfw_events_api.py`, new --
+separate from `test_gfw_api.py`, which only tests v3/4wings/report):
+called all 5 real event dataset types
+(`public-global-{fishing,encounters,loitering,port-visits,gaps}-events:latest`)
+against a real token. Real, confirmed findings:
+- **GAP is a real, working event type** with rich real fields: `gap.intentionalDisabling`
+  (GFW's own suspected-deliberate-AIS-shutoff flag), `durationHours`,
+  `distanceKm`, `impliedSpeedKnots`, `on`/`offPosition`.
+- **Course/heading and instantaneous per-position speed are NOT present**
+  in any of the 5 real event schemas returned -- checked directly, not
+  assumed from docs. `fishing`/`loitering`/`encounter` events do carry an
+  *averaged* speed over the whole (often multi-day) event, not an
+  instantaneous heading/speed at a point in time. This is a real,
+  confirmed external constraint: a literal "course deviation" score isn't
+  buildable at this API tier.
+- **Spatial (bbox/geometry) filtering on v3/events is forbidden for this
+  token's tier**: `POST /v3/events` with a `geometry` body returns real
+  `403 {"message":"Not authorized by permissions"}` -- confirmed by
+  direct test, and confirmed NOT specific to the geometry field (an empty
+  POST body gets the same 403; the whole POST path is restricted). A
+  named-region filter (`region-ids[0]`/`region-datasets[0]`, real
+  kebab-case params -- GFW's own docs show them in camelCase, which
+  actually 422s) works via GET, but a named region (EEZ/RFMO/etc.) is far
+  too coarse for this project's few-degree case bboxes.
+- **Real workaround found and used**: `vessels[0]=<vessel_id>` on GET
+  works with this token and needs no spatial filter at all -- confirmed
+  with a real vessel_id already known from the presence-record step
+  (`fetch_vessel_presence`'s `vesselId` field turns out to be the same ID
+  space as `vessel.id` in events responses). This is also the *right*
+  design regardless of the permission issue: gap events are checked per
+  already-identified candidate vessel, not via a fresh area search.
+
+**Implemented, given those findings** (`src/attribution/gfw_client.py`'s
+`fetch_vessel_gap_events()`, `src/attribution/score_vessels.py`'s
+`trajectory_evidence()`/`behavior_evidence()`):
+- **Behavioral-anomaly sub-score**: real AIS-gap check per top-N
+  candidate. `GAP_INTENTIONAL_BONUS=0.15` / `GAP_ANY_BONUS=0.05`
+  (documented, not tuned -- same honesty as `DISTANCE_SCALE_KM`/
+  `TIME_SCALE_HOURS`) subtracted from `score` to produce `composite_score`,
+  a genuinely separate field shown alongside the original `score` (never
+  silently blended) -- both are in the output JSON and the dashboard's
+  vessel-card detail rows, and the AIS-gap evidence itself (duration,
+  distance, GFW's intentional flag) is an always-visible card bullet, not
+  buried in the expandable detail.
+- **Trajectory evidence**: `n_presence_records` and `closest_approach_km`,
+  computed from the SAME presence records already fetched for the
+  distance+timing pass (no new API call) -- looks at ALL of a candidate
+  vessel's real rows in the query window, not just the single
+  closest-in-time one `score_vessels()` keeps, to see whether its track
+  came closer to the origin at some other point. This substitutes for a
+  true continuous track (which the API doesn't expose at this tier) with
+  something real and auditable rather than fabricated.
+- **Documented limitation, not hidden**: behavioral/trajectory checks only
+  run for the top `TOP_N=15` candidates (already narrowed by
+  distance+timing, which is free/already-fetched) -- each vessel checked
+  costs one real GFW call, so this doesn't re-scan the full 355-1006 raw
+  candidates per case for a hidden AIS-gap outlier ranked outside the
+  top 15. A real engineering tradeoff, stated in the output JSON's
+  `methodology.note`, not silently assumed away.
+
+**Real result: this changed an actual ranking.** ow-0001's top suspect
+flipped from THOR FREYJA (distance-only score 0.029) to **SANCO SEA**
+(distance-only score 0.067, but a real confirmed intentional AIS gap in
+the origin window drops its composite_score to 0.000, clipped at the
+floor) -- a real, substantive change driven by genuine new evidence, not
+a cosmetic one. Worth flagging honestly: composite_score hitting exactly
+0.000 (match_score_pct=100%) is a real, if slightly blunt, consequence of
+`GAP_INTENTIONAL_BONUS` (0.15) exceeding SANCO SEA's original score
+(0.067) -- a future session might reconsider whether an intentional gap
+should be able to fully zero out an otherwise-real distance/timing
+mismatch, rather than just discount it. Flagging this rather than quietly
+shipping a suspiciously round number. ow-0002 had no real AIS gaps among
+its top 15 -- ALAWAD1 stays #1, an honest null result, not forced signal.
+
+### Geometric characterization added
+
+Confirmed via direct search of `src/` that nothing computed area/length/
+width/orientation/shape from a mask -- the pipeline stopped at the raw
+probability array (`detection/inference.py`). Added
+`src/detection/geometry.py`'s `characterize_mask()`: `cv2.findContours` +
+`cv2.minAreaRect` on the largest connected component (both already
+project dependencies, no new one added) -- area, length, width,
+orientation, elongation (length/width ratio, a basic real-vs-look-alike
+shape cue per the PS's "characterise... shape"), and component count (a
+real spill can fragment into several pieces). 6 new pytest tests
+(synthetic masks with known geometry), all passing alongside the
+existing 22.
+
+**Real-world units (km²/m) are deliberately NOT computed for the demo
+tile.** Checked the actual Zenodo dataset record page
+(`10.5281/zenodo.8346860`) directly rather than assuming a resolution --
+it documents pixel dimensions (2048x2048) and calibration (Sigma0-dB) but
+explicitly does NOT state a Sentinel-1 product type or ground sample
+distance. Reporting a km² number without a real documented GSD would be
+exactly the kind of fabricated precision this project's `DECISIONS.md`
+and `LOG.md` have consistently avoided elsewhere (see "Confidence
+relabeled to match score"). `characterize_mask()` accepts an optional
+`pixel_size_m` and only computes real-world fields when it's given
+explicitly -- never assumed. (The two validated PANGAEA drift cases DO
+have a confirmed real Sentinel-1 IW GRDH product ID with a known 10m
+spec, but geometric characterization isn't wired to those images in this
+pass, only to the Zenodo Part III demo tile shown in the dashboard's
+Detection Overlay panel.)
+
+Real output on the current demo tile (Part III, `00000.tif`): ground
+truth 247,402 px across 5 real components (the largest component's
+bounding box spans nearly the full 512px tile -- elongation reads as
+1.0, a real but somewhat blunt consequence of `minAreaRect` on a
+large/irregular multi-part shape, not a bug); the current trained
+model's prediction on this tile is empty (0 px, consistent with the
+already-documented threshold-miscalibration issue, not a new problem).
+Wired into `build_dashboard.py`'s Detection Overlay panel as a new
+`.geo-strip` row showing both ground-truth and prediction geometry side
+by side, explicitly labeled "pixel units only" with the reason why.
+
+### Design doc (item 5) confirmed absent, not partially present
+
+`docs/` is empty and no file matching `step3-attribution-design.md` (or
+the `S_prox`/`S_time`/`S_course`/`F_gap`/`S_type` model it allegedly
+contained) exists anywhere in the repo or in LOG.md/DECISIONS.md history.
+Reported as genuinely absent rather than guessed at. Its core open
+question -- whether GFW's events endpoint was ever tested against a real
+token -- is answered directly above: it had not been, until this session.
+
+## 2026-08-27 — Full-pool behavioral rescoring (closing a real
+selection-bias gap from the previous entry)
+
+The previous entry's behavioral/trajectory scoring only ran against the
+top 15 candidates by proximity+timing, with a stated reason (one GFW call
+per vessel, so checking the full 355-1006-vessel pool looked expensive).
+The user correctly flagged this as a real selection-bias risk, not just a
+caveat: a vessel with a genuine AIS gap but middling proximity/timing
+would never surface, since the behavioral check never ran on it. Asked to
+audit the real cost before doing anything, per this project's own
+"verify against real behavior" pattern rather than assuming.
+
+**Real cost audit, done before committing to anything**: tested whether
+`v3/events`' `vessels[]` filter can batch multiple vessel IDs into one
+request (it can -- confirmed with a real 5-vessel batch first), then
+binary-searched the real batch-size limit against the live API (not
+documented anywhere by GFW): **20 vessel IDs succeeds, 21 fails with a
+real, slightly misleading 422** (`"each value in vessels must be a
+string"` / `"vessels must be an array"` -- actually an array-length cap,
+not a type error). That makes full-pool coverage `ceil(n/20)` requests,
+not `n`: **18 requests for ow-0001's 355 candidates, 51 for ow-0002's
+1006** -- 69 total, trivial against the real 50,000/day quota. Confirmed
+affordable before spending any GPU/API time on it, per the user's
+explicit ask.
+
+**Implemented**: `gfw_client.fetch_gap_events_batch()` replaces the
+previous one-vessel-at-a-time `fetch_vessel_gap_events()`, batching
+`MAX_VESSELS_PER_EVENTS_REQUEST=20` IDs per real request. `score_case()`
+now runs behavioral+trajectory scoring against the ENTIRE `ranked` pool,
+re-sorts the full pool by `composite_score`, and only then slices to
+`TOP_N` for the displayed ranking -- selection happens after full-pool
+evidence, not before.
+
+**Real result: a genuine negative finding, reported honestly rather than
+padded.** Re-running both cases against their full pools found real AIS
+gaps in **5 of ow-0001's 355 candidates** and **14 of ow-0002's 1006**,
+but in both cases none of the additional gap-flagged vessels were close
+or timely enough to break into the top 15 -- **both rankings are
+unchanged** from the top-15-only version (SANCO SEA still #1 for
+ow-0001 via its real intentional gap; ALAWAD1 still #1 for ow-0002, no
+gap at all among its top candidates). The earlier top-15 restriction did
+not, in these two specific validated cases, hide a stronger candidate --
+but that's a fact now confirmed by checking, not something that could
+have been assumed from the restriction's existence alone. New
+`n_candidates_with_ais_gap` field added to each case's output JSON so
+this real denominator (5/355, 14/1006) stays visible, not just the ones
+that made the top 15.
+
+Confirmed the output stays fully auditable after this change (proximity,
+timing, trajectory, and AIS-gap fields are still separate, un-blended
+JSON fields -- see a real sample row in LOG.md). Both dashboard builds
+(real + anonymized) regenerated fresh from the full-pool results and
+re-checked for real-name leakage -- zero leaks, confirmed by grep, not
+assumed to still hold from the earlier spot-check.
+
+## 2026-08-27 — Map redesign: simplified default view, still 100% real data
+
+User supplied a reference mockup (clean drift cone, labeled ship icons,
+a persistent "Estimated Origin" callout, visible coastline/geography) and
+asked the real map to look that clean and understandable. Same tension as
+the earlier "Dashboard visual redesign" entry: match the reference's
+clarity without copying its actual approach, which uses fabricated ship
+icons at fixed positions -- everything here stays wired to real data.
+
+**Real geographic context, verified rather than guessed**: reverse-
+geocoded both cases' real coordinates via OpenStreetMap Nominatim.
+ow-0001 (33.06E, 33.26N) returns "Unable to geocode" even at zoom 5 --
+confirmed genuine open water, not attributable to one country -- so it's
+labeled "Levantine Sea, Eastern Mediterranean, open water between Cyprus
+and the Nile Delta coast" (consistent with `scripts/run_drift_skeleton.py`'s
+existing docstring). ow-0002 (32.03E, 31.68N) returns a real match:
+Damietta (Dumyat), Egypt. Added `geo_context` to `CASES` in
+`export_drift_dashboard_data.py`, exported to the drift JSON, shown as a
+fixed label on the map and in the dashboard's panel subtitle.
+
+**Real detected-slick footprint**: added `detection_bbox` to the exported
+JSON -- the actual labeled-object bbox (PANGAEA metadata) already used to
+seed advection particles, now also drawn as a real (if small, ~1km)
+rectangle on the map, instead of only a point marker.
+
+**Drift reconstruction cone replaces 50 raw lines as the default view**:
+`build_map.py`'s new `drift_cone_latlon()` computes a real convex hull
+(`scipy.spatial.ConvexHull`, already an installed dependency via
+`scipy`/`geopandas` -- no new dependency added) over every real particle
+position at every real simulated timestep, both backward and forward, and
+draws that single translucent polygon as the default-visible layer. The
+raw per-particle tracks are NOT deleted or hidden permanently -- they're
+still real, still there, just moved to a togglable "raw particle tracks"
+layer (`show=False` by default) for anyone who wants to inspect individual
+trajectories. Simplifies the default view without losing or approximating
+the underlying physics output.
+
+**Ship icons instead of dots**: candidate vessels now render with
+`folium.Icon(icon="ship", prefix="fa")` at their real GFW positions.
+folium's built-in Icon only accepts named colors, not arbitrary hex, so
+"orange"/"cadetblue" (closest real matches to this theme's amber/teal)
+are used for the icon background rather than trying to force exact hex --
+a deliberate, minor concession to using folium's built-in icon system
+instead of hand-rolling SVG markers.
+
+**Persistent callouts, matching the reference's always-visible info
+boxes**: the ERA5 (primary) origin marker now shows a permanent Leaflet
+tooltip with the real origin date/time/coordinates, and the #1-ranked
+vessel gets a permanent "★ {real ship name} — top suspect" label, instead
+of requiring a click for either. NCEP/NCAR (secondary/toggle source) and
+non-top candidates keep click/hover-only info so the default view doesn't
+end up with a dozen overlapping permanent boxes. `DARK_CHROME_CSS` gained
+`.leaflet-tooltip` styling (previously only popups/controls were dark-
+themed) so these new permanent tooltips match the theme instead of
+showing Leaflet's default white box.
+
+Verified after rebuilding both real and anonymized maps/dashboards fresh:
+the new permanent top-suspect label correctly shows "Vessel A" (not the
+real name) in the anonymized build, real names only appear in the real
+build, and 28/28 tests still pass.
+
+## 2026-08-27 — The whole detection-tuning diagnosis was chasing a
+misleading metric; reversed course
+
+Three genuinely different fixes (pos_weight reduction, oil-tile
+oversampling, a full Tversky loss swap) all left the training loop's
+`val_dice` flat in the same ~0.020-0.023 band. Rather than accept that at
+face value, built `scripts/compare_checkpoints_on_val.py` -- a real
+threshold-swept oil-tiles-only IoU comparison on the validation set
+(reusing `evaluate_test_set.py`'s real logic, deliberately NOT touching
+Part III test set again, per this project's own "read it exactly once"
+rule) -- to check whether the flat raw metric was hiding real learned
+discrimination the metric itself is structurally blind to (it's computed
+on raw, unthresholded sigmoid probabilities -- see `train.py`'s
+`evaluate()` -- which heavily penalizes low absolute confidence
+regardless of real relative separation between oil and background).
+
+**Real result, and it overturned the whole diagnosis**: the ORIGINAL,
+untouched checkpoint (pos_weight=32.6, plain DiceBCE, no oversampling)
+scored the best real oil-tiles-only IoU of the three -- **0.1057 at
+threshold 0.35**, with a real, smooth threshold-sensitivity curve
+(0.089-0.106 across the sweep, meaning its probabilities carry genuine
+graded confidence). `trial_oversample`'s best checkpoint scored **0.0828**,
+flat at exactly 0.0799 across thresholds 0.18-0.35 -- a real sign of a
+saturated/degenerate probability distribution, not graded confidence.
+`trial_tversky`'s best checkpoint scored **0.0800 at every single
+threshold from 0.18 to 0.50, with zero variation** -- an extremely strong
+signal the model collapsed to a near-binary output that doesn't
+discriminate at any operating point in that range.
+
+**The original checkpoint was the best one the entire time.** All three
+loss/sampling interventions this session made REAL, properly-evaluated
+performance worse, not better -- even though their raw training-loop
+metric looked similarly flat to each other, giving no hint of this.
+
+**Root cause of the misdiagnosis**: the original alarm ("val_dice
+plateaued below a trivial predict-all-oil baseline") compared raw
+unthresholded dice (~0.0233) against a dice-equivalent trivial baseline
+(~0.058) -- but the equivalent trivial baseline in real IoU terms is only
+~0.03, and the original checkpoint's real thresholded IoU (0.1057) is
+already well above that. The raw metric made an already-reasonable model
+look broken, and three real experiments got spent chasing that false
+signal, each one trading away real calibrated confidence for a lower
+raw-metric number that looked the same as before regardless.
+
+**Reversed course rather than run a 4th loss variant blind**: killed
+`trial_posweight_sched` after 1 epoch (its epoch-1 val_dice, 0.0136, was
+already the lowest of any trial -- consistent with the same failure
+mode) and resumed training from the REAL best checkpoint
+(`data/processed/checkpoints/latest_unet_resnet18.pt`, epoch 39,
+unmodified pos_weight=32.6/DiceBCE -- the one lineage now demonstrated to
+actually work) with `--use-lr-scheduler` added on top -- the one lever
+never tested against the setup that's real evidence shows performs best,
+rather than against a loss/sampling change that was actively hurting it.
+
+**Lesson for the rest of this project, not just this run**: raw
+`val_dice` (unthresholded) is not a reliable signal for model-selection
+or go/no-go decisions in this class-imbalance regime -- a real
+threshold-swept IoU check should run before trusting it for any future
+tuning decision, not after three experiments have already been spent.

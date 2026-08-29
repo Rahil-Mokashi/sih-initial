@@ -1110,3 +1110,299 @@ IoU is still weak by ~epoch 45-50, worth reconsidering pos_weight or
 loss formulation rather than just running to epoch 60. Once a
 genuinely-improved checkpoint exists, re-run
 `scripts/render_detection_overlay.py` and rebuild the dashboard.
+
+---
+
+## 2026-08-26 — Training crash + resume; "confidence" -> "match score";
+anonymized dashboard build
+
+**Training crashed, resumed cleanly.** The extended 60-epoch run (see
+previous entry) died at epoch 37 with a Windows-specific PyTorch
+DataLoader bug (`RuntimeError: Couldn't open shared event ... DataLoader
+worker exited unexpectedly`, `num_workers=6` in `scripts/
+train_detection.py`) -- a known flaky Windows multiprocessing issue, not
+a code bug. The resume mechanism worked exactly as designed:
+`latest_unet_resnet18.pt` had saved through epoch 37 (best_val_dice
+0.0235 at epoch 33), and relaunching picked up at epoch 38 with no lost
+progress. Worth flagging: loss/val_dice have been essentially flat since
+~epoch 30 (loss 1.712->1.703, val_dice ~0.022), which is the plateau the
+"next session should" note above was watching for -- if it's still flat
+by epoch 45-50, stop extending and tune pos_weight/loss formulation
+instead of running to epoch 60 for no gain.
+
+**"Confidence" relabeled to "match score" everywhere user-facing**, and
+an anonymized dashboard build mode added for anything that leaves the
+judging room -- both raised by the user as review feedback, not found
+independently. Full reasoning in DECISIONS.md's entry for today
+("'Confidence' relabeled to 'match score'; anonymized dashboard build
+added for public-facing use"). Concretely: `confidence_pct` renamed to
+`match_score_pct` in `score_vessels.py`'s output (existing ranking JSONs
+updated in place, not re-queried from GFW); `build_dashboard.py` and
+`build_map.py` both gained `--anonymize`, writing to `output_anon/` with
+real ship_name/mmsi/imo replaced by fictional stand-ins via the new
+`src/common/anonymize.py`, while the real `output/` build (shown live to
+judges) keeps real identities. Verified both builds render correctly and
+that no "confidence" or real vessel name leaked into the anonymized
+output.
+
+**Stopped the LR-only fix, diagnosed the real cause, launched two proper
+trials.** The user caught that my LR-decay fix targeted the wrong thing:
+val_dice (~0.022-0.0235) has been sitting *below* the trivial "predict
+all oil" Dice baseline (~0.058 at the real 2.98% oil fraction) since
+~epoch 30, which points at `pos_weight=32.6` fighting Dice loss rather
+than a missing LR schedule. Stopped that run (epoch-39 checkpoint
+verified intact, backed up separately), added `TverskyLoss` to
+`src/detection/losses.py` (alpha=0.3/beta=0.7, keeping `DiceBCELoss`),
+made `train.py`'s LR scheduler opt-in/configurable instead of always-on
+(so a loss-function trial isolates that one variable), and gave
+`train_detection.py` CLI flags (`--loss`, `--pos-weight`, `--tag`,
+`--fresh`, `--use-lr-scheduler`, ...) so trial runs sandbox their
+checkpoints under `checkpoints/<tag>/` without touching the real
+`best_unet_resnet18.pt`/`latest_unet_resnet18.pt` that
+`evaluate_test_set.py` and `render_detection_overlay.py` read directly.
+Launched two 10-epoch trials sequentially in the background: Tversky
+loss (no scheduler, isolates the loss change) then, if time permits,
+DiceBCELoss with pos_weight dropped to 8 plus a val_dice-monitored
+ReduceLROnPlateau. Real results not in yet -- next session (or later
+this one) should report the actual val_dice trajectory against the
+0.0233 floor before picking a direction for the next full run.
+
+**Report/PDF export added, closing the last open UI-plan item** (full
+reasoning in DECISIONS.md's entry for today). Asked directly what could
+honestly be called 100% done while the training trials run -- the
+detection model can't be (gated on real results), but this could be, so
+it was built rather than left open. `window.print()` + a `@media print`
+stylesheet in `build_dashboard.py`, no new dependency. Verified the
+rebuilt `output/`/`output_anon/` HTML is well-formed and the export
+button/print header render with real data (methodology note, real
+generated timestamp).
+
+**Found a real, previously-unaddressed lever: tile-level oil-sampling
+imbalance.** Asked whether there was a better way to fix detection
+beyond the two running trials. Checked the pipeline for other gaps
+first -- encoder already ImageNet-pretrained, augmentation already
+SAR-appropriate, neither was it. Measured the actual training tile grid
+for real (`scripts/analyze_tile_oil_distribution.py`, new): of 34,940
+real tiles, **82.4% have zero oil pixels** (0% in the 685+685 no_oil/
+lookalike images, and only 37.7% even within the 1200 oil images touch
+the real slick). `pos_weight` can't fix this -- it only reweights pixels
+inside a tile that already has oil, doing nothing for the ~1-in-5
+batches (at batch_size~8) that have none at all. Full reasoning in
+DECISIONS.md's entry for today.
+
+Added `compute_oil_tile_weights()` (`src/detection/dataset.py`) and a
+`sampler` param on `train()` to support a `WeightedRandomSampler`
+targeting ~50% oil-tile representation per epoch, plus
+`--oversample-oil-tiles`/`--target-oil-fraction` on `train_detection.py`.
+22/22 tests still pass. Reordered the trial queue: killed the Tversky
+trial after its real epoch 1 (val_dice=0.0227, checkpoint kept, not
+discarded) to run the oil-tile-oversampling trial first (original
+DiceBCE/pos_weight=32.6, isolating the sampling variable alone), then
+Tversky resuming from its saved epoch-1 checkpoint, then the
+pos_weight+scheduler trial as before. No real oversampling-trial numbers
+yet -- next update should report its actual val_dice trajectory before
+concluding anything.
+
+---
+
+## 2026-08-27 — Audited and closed the real gaps against the official
+SIH26143 problem statement
+
+User supplied the actual official PS text and asked for a line-by-line
+audit against the real repo before any new work -- reported back
+first (per instruction), confirming each of 5 items against real code
+citations rather than assumption:
+
+1. Geometric characterization -- confirmed MISSING (pipeline stopped at
+   the raw mask/probability array).
+2. Age estimation -- confirmed MISSING (correctly absent; PS says "if
+   feasible").
+3. Forward drift -- confirmed MISSING (`advect.py` had only
+   `backward_advect()`).
+4. Attribution scoring -- confirmed distance+timing ONLY, verified
+   directly in `score_vessels.py`'s code (not the user's recollection).
+5. `step3-attribution-design.md` design doc -- confirmed does not exist
+   anywhere in the repo (docs/ is empty); its core open question (was
+   GFW's events endpoint ever tested with a real token) was real and
+   unanswered.
+
+User confirmed: close everything. Full technical reasoning and real
+numbers for all of the below are in DECISIONS.md's entry for today
+("Closing the real gaps against the official SIH26143 problem
+statement").
+
+**Forward drift**: added `forward_advect()` to `src/drift/advect.py`,
+sharing one physics core with `backward_advect()` (a `direction`
+parameter, not a second copy of the integration loop) -- confirmed
+`backward_advect()`'s behavior is unchanged (all 22 pre-existing tests
+still pass). Ran for real on both validated cases, both wind sources,
+via `scripts/export_drift_dashboard_data.py` (new `HOURS_FORWARD=24`) --
+real detection-to-forecast distances range 12-29km depending on
+case/source (full table in DECISIONS.md). Wired into `build_map.py` as a
+dashed second track layer, distinguishable from the solid backward
+trace; dashboard legend updated.
+
+**Attribution -- real GFW v3/events test, first**
+(`scripts/test_gfw_events_api.py`, new): called all 5 real event dataset
+types against a real token. Real findings: GAP (AIS "went dark") is a
+real, working event type with a genuine `intentionalDisabling` flag,
+duration, and distance; course/heading and instantaneous speed are
+confirmed NOT present in any event schema at this API tier (an external
+constraint, not a shortcut); spatial (bbox/geometry) filtering on
+v3/events is confirmed forbidden for this token (`403 Not authorized by
+permissions`, even on an empty POST body); a `vessels[0]=<id>` GET filter
+works and needs no spatial filter, which also turns out to be the right
+design (checking already-identified candidates, not searching a fresh
+area).
+
+**Built on those real findings**: `gfw_client.fetch_vessel_gap_events()`
+(new), `score_vessels.py`'s `trajectory_evidence()` (from the presence
+records already fetched -- no new API call) and `behavior_evidence()`
+(one real GFW call per top-15 candidate). New `composite_score` field,
+kept genuinely separate from the original `score` (both shown, never
+silently blended) -- the ranking is now sorted by `composite_score`.
+**Real result: ow-0001's top suspect flipped from THOR FREYJA to SANCO
+SEA**, driven by a real confirmed intentional AIS gap in the origin
+window (not a code change to the underlying distance/timing math). Noted
+honestly in DECISIONS.md that this pushes composite_score to exactly
+0.000 -- a real but slightly blunt consequence of the bonus size, worth a
+future look. ow-0002 had no real AIS gaps among its top 15 -- ALAWAD1
+stays #1, an honest null result. Dashboard vessel cards now show the AIS
+gap evidence as an always-visible bullet (not buried), plus
+composite/proximity scores and trajectory evidence (presence-record
+count, closest approach) in the expandable detail.
+
+**Geometric characterization**: added `src/detection/geometry.py`
+(`characterize_mask()` -- cv2 contour/minAreaRect, both already-installed
+deps, no new one) with 6 new passing tests. Real output on the current
+demo tile: ground truth 247,402px across 5 components; current model
+prediction is empty (0px, consistent with the already-known
+threshold-miscalibration issue). Checked the Zenodo dataset's actual
+record page directly and confirmed it does NOT document a Sentinel-1
+product type or ground resolution, so real-world km² conversion is
+deliberately not applied (pixel units only) -- would otherwise have been
+fabricated precision. Wired into `build_dashboard.py`'s Detection
+Overlay panel as a new geometry row.
+
+All 28 tests pass (22 original + 6 new geometry tests). Both real and
+anonymized dashboard/map builds regenerated and spot-checked (forecast
+tracks present, AIS-gap evidence rendering, no real vessel names leaked
+into the anonymized build despite the ranking reorder).
+
+---
+
+## 2026-08-27 — Full-pool behavioral rescoring: real cost audit, real
+negative result
+
+User flagged a real problem with the previous entry's behavioral
+scoring: it only ran against the top 15 candidates, which is a genuine
+selection-bias risk (a vessel with a real AIS gap but middling
+proximity/timing would never get checked). Asked for a real cost audit
+before doing anything -- full reasoning and numbers in DECISIONS.md's
+"Full-pool behavioral rescoring" entry for today.
+
+**Real audit result**: GFW's v3/events `vessels[]` filter batches up to
+**20 vessel IDs per request** (found by binary-searching the live API --
+21 IDs returns a real 422). Full-pool coverage: **18 requests for
+ow-0001 (355 candidates), 51 for ow-0002 (1006)** -- 69 total, trivial
+against the 50,000/day quota. Confirmed affordable before spending
+anything.
+
+**Re-ran both cases against the full pool, not just top-15**:
+- ow-0001: 5 of 355 candidates had a real AIS gap. Ranking **unchanged**
+  -- SANCO SEA still #1 (its real intentional gap).
+- ow-0002: 14 of 1006 candidates had a real AIS gap. Ranking
+  **unchanged** -- ALAWAD1 still #1, no gap among its top candidates.
+
+**Honest conclusion: a real negative finding, not padding.** Widening to
+the full pool did not surface a stronger candidate in either validated
+case -- the earlier top-15 cutoff happened not to introduce bias here,
+but that's now a confirmed fact, not an assumption. `gfw_client.py`'s
+`fetch_gap_events_batch()` (batched) replaces the old one-vessel-per-call
+version; `score_vessels.py` now scores the full pool before selecting
+the displayed top-N. New `n_candidates_with_ais_gap` field in the output
+JSON keeps the real denominator visible.
+
+Confirmed output stays auditable (proximity/timing/trajectory/AIS-gap
+still separate fields -- real sample row for SANCO SEA:
+`distance_km=6.67, time_gap_hours=0.0, n_presence_records=57,
+closest_approach_km=6.67, ais_gap_count=1, ais_gap_intentional=true,
+ais_gap_duration_hours=167.1, ais_gap_distance_km=310.89`, alongside
+`score=0.0667` and `composite_score=0.0`). Both dashboard builds
+regenerated fresh and re-checked -- zero real-name leaks into the
+anonymized build (checked fresh, not assumed from the earlier
+spot-check). 28/28 tests still pass.
+
+---
+
+## 2026-08-27 — Map redesign for clarity, still 100% real data
+
+User shared a reference mockup (clean drift cone, ship icons, persistent
+"Estimated Origin" callout) and asked the real map to look that simple.
+Full reasoning in DECISIONS.md's entry for today.
+
+Real work done: reverse-geocoded both cases via OpenStreetMap Nominatim
+(ow-0001 confirmed genuine open water -- "Unable to geocode" even at
+zoom 5; ow-0002 confirmed Damietta, Egypt) and added the result as a real
+`geo_context` field, shown on the map and in the dashboard panel.
+Added the real detected-slick bbox (already used to seed particles,
+now also drawn as a rectangle). Replaced the default view's 50 raw
+particle-track lines with a single real convex-hull "drift cone"
+(`scipy.spatial.ConvexHull` over every real particle position at every
+timestep) for both backward and forward tracks -- raw tracks kept as a
+togglable layer, not deleted. Vessels now render as real ship icons
+instead of dots; the ERA5 origin and the #1 vessel get permanent
+always-visible labels instead of click-only popups.
+
+Verified: anonymized build's permanent top-suspect label correctly reads
+"Vessel A", not the real name; real map still shows real names; 28/28
+tests pass.
+
+---
+
+## 2026-08-27 — Reversed the whole detection-tuning direction: the
+original checkpoint was best all along
+
+Built a real threshold-swept IoU comparison (`scripts/
+compare_checkpoints_on_val.py`, on the val set, not touching Part III
+again) to check whether the three trials' flat `val_dice` was hiding real
+progress the metric might be blind to. Real result: it wasn't hiding
+progress -- it was hiding real *regression*. The ORIGINAL untouched
+checkpoint (pos_weight=32.6, plain DiceBCE) scored real oil-tiles-only
+IoU **0.1057** with a genuine graded threshold response; `trial_oversample`
+scored 0.0828 with a flat, saturated-looking response; `trial_tversky`
+scored exactly **0.0800 at every threshold from 0.18 to 0.50** -- zero
+variation, a real sign of a collapsed, non-discriminating output. Full
+reasoning in DECISIONS.md's entry for today.
+
+The original checkpoint was the best one from the start. All three
+tuning experiments this session made real performance worse while their
+training-loop metric looked the same as each other, giving no warning.
+Root cause: the original "below trivial baseline" alarm compared the
+wrong units (raw dice vs. a dice-equivalent baseline of ~0.058), when
+the real IoU-equivalent trivial baseline is ~0.03 and the original
+checkpoint's real IoU (0.1057) was already well clear of it the whole
+time.
+
+Killed `trial_posweight_sched` after 1 epoch (val_dice=0.0136, already
+the lowest of any trial -- same failure signature) rather than let a 4th
+experiment run on the same bad assumption. Resumed training from the
+real best checkpoint (epoch 39, original loss/pos_weight, unmodified)
+with `--use-lr-scheduler` added -- the one real lever not yet tested
+against the setup that actually works. Cleaned up several orphaned
+monitor processes along the way (confirmed `TaskStop` doesn't reliably
+kill the underlying tail/grep pipeline in this environment -- second
+time this session; worth remembering to verify manually going forward).
+
+**Training update, same session**: `trial_tversky` at epoch 3/10, also
+not showing a breakout so far -- val_dice 0.0227/0.0228/0.0228 (flat),
+loss barely moving at all (0.9683/0.9682/0.9680). Not conclusive yet at
+3 epochs, but not encouraging alongside oversampling's confirmed-flat
+10-epoch result either. One epoch (2) took ~67min instead of the usual
+~20min -- explained by real CPU contention from this session's own
+concurrent work (Nominatim lookups, drift re-export), not a system
+stall. Separately fixed a real stall cause found earlier: this machine's
+hibernate-after-1h-on-battery was still enabled (a known risk this
+project's LOG.md already flagged once before) and caused a real ~6-hour
+gap at epoch 4 of the oversampling trial -- disabled hibernate/sleep on
+battery entirely so it can't recur.

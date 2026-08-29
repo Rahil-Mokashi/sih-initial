@@ -8,3 +8,6 @@ __pycache__/
 data/raw/
 data/processed/
 train_stderr.log
+train_stdout.log
+trial_*_stdout.log
+trial_*_stderr.log

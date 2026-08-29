@@ -26,17 +26,29 @@ CASES = {
         "detection_time": datetime(2019, 1, 1, 3, 42, 35, tzinfo=timezone.utc),
         "obj_lon_range": (33.0545345548213, 33.0610206397016),
         "obj_lat_range": (33.2547758037478, 33.2637343446692),
+        # Real, confirmed via a direct reverse-geocoding lookup (OpenStreetMap
+        # Nominatim, zoom 5 and 10 both return "Unable to geocode" -- this point
+        # is genuine open water, not attributable to a single country's
+        # nearshore area) -- not guessed. Sea name matches what this project's
+        # own scripts/run_drift_skeleton.py docstring already documented
+        # ("Eastern Mediterranean, between Cyprus and Egypt").
+        "geo_context": "Levantine Sea, Eastern Mediterranean — open water between Cyprus and the Nile Delta coast",
     },
     "ow-0002": {
         "detection_time": datetime(2019, 1, 4, 15, 56, 38, tzinfo=timezone.utc),
         "obj_lon_range": (32.0268313998942, 32.0310868011572),
         "obj_lat_range": (31.6795634053252, 31.6913258699428),
+        # Real, confirmed via direct reverse-geocoding lookup (Nominatim
+        # returns "Dumyat, Egypt" / country_code "eg" for this exact point).
+        "geo_context": "Eastern Mediterranean, off Damietta (Dumyat), Egypt",
     },
 }
 
 CASE_IDS_TO_RUN = ["ow-0001", "ow-0002"]  # every case here gets (re-)run
 
 HOURS_BACK = 24
+HOURS_FORWARD = 24  # same window length as HOURS_BACK -- symmetric hindcast/forecast horizon,
+                     # not a physical constraint (see DECISIONS.md "Forward drift forecasting added")
 WIND_PADDING_DEG = 2.0
 N_PARTICLES = 50
 
@@ -65,14 +77,27 @@ def wind_snapshot(wind_ds) -> list[dict]:
 
 def run_source(name: str, fetch_wind_window, detection_time, obj_lon_range, obj_lat_range) -> dict:
     print(f"running {name}...")
-    start_time = detection_time - timedelta(hours=HOURS_BACK)
     lon_range = (obj_lon_range[0] - WIND_PADDING_DEG, obj_lon_range[1] + WIND_PADDING_DEG)
     lat_range = (obj_lat_range[0] - WIND_PADDING_DEG, obj_lat_range[1] + WIND_PADDING_DEG)
-    wind_ds = fetch_wind_window(start_time, detection_time, lat_range, lon_range)
+
+    backward_start = detection_time - timedelta(hours=HOURS_BACK)
+    wind_ds_back = fetch_wind_window(backward_start, detection_time, lat_range, lon_range)
 
     lons0, lats0 = advect.seed_particles_in_bbox(*obj_lon_range, *obj_lat_range, n_particles=N_PARTICLES)
-    traj = advect.backward_advect(lons0, lats0, detection_time, HOURS_BACK, wind_ds, dt_hours=1.0)
+    traj = advect.backward_advect(lons0, lats0, detection_time, HOURS_BACK, wind_ds_back, dt_hours=1.0)
     region = advect.origin_region(traj)
+
+    # Forward forecast -- same seed particles (the detection bbox), same
+    # physics, opposite time direction (see DECISIONS.md "Forward drift
+    # forecasting added"). Needs its own wind fetch: [detection_time,
+    # detection_time + HOURS_FORWARD] instead of the backward window.
+    # Reuses the same padded lat/lon box as the backward fetch -- at
+    # typical drift speeds over a 24h window the forecast track stays
+    # well within it, a documented simplification, not a hard limit.
+    forward_end = detection_time + timedelta(hours=HOURS_FORWARD)
+    wind_ds_fwd = fetch_wind_window(detection_time, forward_end, lat_range, lon_range)
+    fwd_traj = advect.forward_advect(lons0, lats0, detection_time, HOURS_FORWARD, wind_ds_fwd, dt_hours=1.0)
+    forecast = advect.origin_region(fwd_traj)
 
     return {
         "name": name,
@@ -85,7 +110,18 @@ def run_source(name: str, fetch_wind_window, detection_time, obj_lon_range, obj_
             for p in range(traj.lons.shape[0])
         ],
         "final_positions": list(zip(traj.lons[:, -1].tolist(), traj.lats[:, -1].tolist())),
-        "wind_snapshot": wind_snapshot(wind_ds),
+        "wind_snapshot": wind_snapshot(wind_ds_back),
+        # Forward forecast -- same shape/fields as the backward ones above, prefixed
+        # "forecast_" so the map layer (build_map.py) can draw it as a distinguishable
+        # second track type rather than mixing it into the backward trace.
+        "forecast_centroid": [forecast["centroid_lon"], forecast["centroid_lat"]],
+        "forecast_lon_std": forecast["lon_std"],
+        "forecast_lat_std": forecast["lat_std"],
+        "forecast_tracks": [
+            list(zip(fwd_traj.lons[p, :].tolist(), fwd_traj.lats[p, :].tolist()))
+            for p in range(fwd_traj.lons.shape[0])
+        ],
+        "forecast_final_positions": list(zip(fwd_traj.lons[:, -1].tolist(), fwd_traj.lats[:, -1].tolist())),
     }
 
 
@@ -99,9 +135,15 @@ def run_case(case_id: str) -> dict:
     result = {
         "case": case_id,
         "detection_point": [detection_lon, detection_lat],
+        # Real labeled-object bbox (PANGAEA metadata) -- the actual detected-slick
+        # footprint used to seed advection particles, not just its centroid. Lets
+        # the map draw a real slick outline instead of a single point.
+        "detection_bbox": {"lon_range": list(obj_lon_range), "lat_range": list(obj_lat_range)},
         "detection_time_utc": detection_time.isoformat(),
         "hours_back": HOURS_BACK,
+        "hours_forward": HOURS_FORWARD,
         "n_particles": N_PARTICLES,
+        "geo_context": case.get("geo_context", ""),
         "sources": [],
     }
 

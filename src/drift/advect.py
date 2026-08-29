@@ -26,6 +26,16 @@ Integration is explicit Euler in lon/lat space with a small flat-Earth
 per-step correction (cos(lat) for longitude spacing); adequate at hourly
 steps over a day-scale window at this latitude, not appropriate for
 multi-week windows or high latitudes without revisiting.
+
+Forward-integration forecasting (forward_advect) was added per the SIH
+problem statement's explicit requirement to "predict the future flow of
+the slick" / trace it "backward AND forward" -- see DECISIONS.md
+"Forward drift forecasting added". It reuses the exact same physics
+(_advect below): same windage/current combination, same Ekman
+deflection, same explicit-Euler integration -- the only difference from
+backward_advect is the sign of the velocity step and the direction time
+moves in, both driven by a single `direction` parameter (+1 forward, -1
+backward) rather than a second, duplicated integration loop.
 """
 
 from __future__ import annotations
@@ -88,23 +98,33 @@ def _interp_wind(wind_ds: xr.Dataset, time: datetime, lons: np.ndarray, lats: np
     return _interp_field(snap["u10"], lons, lats), _interp_field(snap["v10"], lons, lats)
 
 
-def backward_advect(
+def _advect(
     lons0: np.ndarray, lats0: np.ndarray,
-    detection_time: datetime, hours_back: int,
+    start_time: datetime, hours: int,
     wind_ds: xr.Dataset,
+    direction: int,
     dt_hours: float = 1.0,
     current_bbox_padding_deg: float = 1.0,
 ) -> Trajectories:
-    n_steps = int(hours_back / dt_hours)
+    """
+    Shared integration core for both backward_advect and forward_advect.
+    direction=-1 steps particles backward in time (hindcast); direction=+1
+    steps them forward (forecast). Physics (current + windage-scaled,
+    Ekman-deflected wind) is identical either way -- only the sign of the
+    velocity step and which way `t` moves differ, both driven by
+    `direction`, so there is exactly one integration loop to keep correct
+    rather than two copies that could drift apart.
+    """
+    n_steps = int(hours / dt_hours)
     n_particles = len(lons0)
 
     lons = np.zeros((n_particles, n_steps + 1))
     lats = np.zeros((n_particles, n_steps + 1))
     lons[:, 0], lats[:, 0] = lons0, lats0
-    times = [detection_time]
+    times = [start_time]
 
     current_cache: dict[tuple, xr.Dataset] = {}
-    t = detection_time
+    t = start_time
 
     for step in range(n_steps):
         cur_lons, cur_lats = lons[:, step], lats[:, step]
@@ -128,16 +148,46 @@ def backward_advect(
         v_total = v_curr + WINDAGE * v_wind
 
         dt_sec = dt_hours * 3600
-        dlat = -v_total * dt_sec / EARTH_RADIUS_M * (180 / np.pi)
-        dlon = -u_total * dt_sec / (EARTH_RADIUS_M * np.cos(np.radians(cur_lats))) * (180 / np.pi)
+        dlat = direction * v_total * dt_sec / EARTH_RADIUS_M * (180 / np.pi)
+        dlon = direction * u_total * dt_sec / (EARTH_RADIUS_M * np.cos(np.radians(cur_lats))) * (180 / np.pi)
 
         lats[:, step + 1] = cur_lats + dlat
         lons[:, step + 1] = cur_lons + dlon
 
-        t = t - timedelta(hours=dt_hours)
+        t = t + direction * timedelta(hours=dt_hours)
         times.append(t)
 
     return Trajectories(times=times, lons=lons, lats=lats)
+
+
+def backward_advect(
+    lons0: np.ndarray, lats0: np.ndarray,
+    detection_time: datetime, hours_back: int,
+    wind_ds: xr.Dataset,
+    dt_hours: float = 1.0,
+    current_bbox_padding_deg: float = 1.0,
+) -> Trajectories:
+    return _advect(lons0, lats0, detection_time, hours_back, wind_ds, direction=-1,
+                    dt_hours=dt_hours, current_bbox_padding_deg=current_bbox_padding_deg)
+
+
+def forward_advect(
+    lons0: np.ndarray, lats0: np.ndarray,
+    detection_time: datetime, hours_forward: int,
+    wind_ds: xr.Dataset,
+    dt_hours: float = 1.0,
+    current_bbox_padding_deg: float = 1.0,
+) -> Trajectories:
+    """
+    Forward-integration forecast of where the slick is headed, from the
+    detection point forward in time -- same physics as backward_advect
+    (see _advect), opposite time direction. `wind_ds` must cover
+    [detection_time, detection_time + hours_forward], not the backward
+    window -- the caller fetches that, same as backward_advect's caller
+    fetches [detection_time - hours_back, detection_time].
+    """
+    return _advect(lons0, lats0, detection_time, hours_forward, wind_ds, direction=+1,
+                    dt_hours=dt_hours, current_bbox_padding_deg=current_bbox_padding_deg)
 
 
 def origin_region(traj: Trajectories) -> dict:

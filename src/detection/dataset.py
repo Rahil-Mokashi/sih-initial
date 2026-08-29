@@ -154,3 +154,48 @@ class ZenodoTileDataset(Dataset):
         image_t = torch.from_numpy(image).unsqueeze(0).float()
         mask_t = torch.from_numpy(mask).unsqueeze(0).float()
         return image_t, mask_t
+
+
+def compute_oil_tile_weights(dataset: "ZenodoTileDataset", target_oil_fraction: float = 0.5) -> np.ndarray:
+    """
+    Per-tile sample weights for a WeightedRandomSampler, so oil-containing
+    tiles make up ~target_oil_fraction of what a training epoch actually
+    samples (with replacement) instead of whatever their real frequency
+    happens to be.
+
+    Added after scripts/analyze_tile_oil_distribution.py measured the real
+    tile grid: 82.4% of all 34,940 training tiles have zero oil pixels
+    (no_oil/lookalike images are 100% zero by construction, and most tiles
+    even within the 1200 oil images miss the slick). pos_weight in
+    DiceBCELoss only reweights pixels *inside* a tile that already has some
+    oil -- it does nothing for the ~4/5 of batches that are entirely
+    oil-free, which is a signal-sparsity problem no loss-function choice
+    can fix. This is a separate lever from loss/pos_weight, kept as its
+    own dataset-level function (not baked into ZenodoTileDataset itself)
+    so a loss-function trial and a sampling trial stay independently
+    testable.
+
+    Reads only the mask band (cheap) for every indexed tile once, up
+    front -- real per-tile ground truth, not an estimate from the whole
+    image's overall oil fraction.
+    """
+    is_oil = np.zeros(len(dataset.index), dtype=bool)
+    for i, (pair_idx, y, x) in enumerate(dataset.index):
+        mask_path = dataset.pairs[pair_idx].mask_path
+        with rasterio.open(mask_path) as src:
+            tile = src.read(1, window=Window(x, y, dataset.tile_size, dataset.tile_size))
+        is_oil[i] = (tile > 0).any()
+
+    n_oil, n_total = int(is_oil.sum()), len(is_oil)
+    n_non = n_total - n_oil
+    if n_oil == 0 or n_non == 0:
+        return np.ones(n_total, dtype=np.float32)
+
+    # Solve for oil_weight such that oil tiles make up target_oil_fraction
+    # of total sample weight, holding non-oil weight at 1.0:
+    #   target = (n_oil * oil_weight) / (n_oil * oil_weight + n_non)
+    oil_weight = target_oil_fraction * n_non / (n_oil * (1 - target_oil_fraction))
+    weights = np.where(is_oil, oil_weight, 1.0).astype(np.float32)
+    print(f"compute_oil_tile_weights: {n_oil}/{n_total} tiles have oil ({100 * n_oil / n_total:.1f}%), "
+          f"weighting oil tiles {oil_weight:.2f}x to target {target_oil_fraction:.0%} representation per epoch")
+    return weights

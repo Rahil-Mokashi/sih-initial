@@ -6,6 +6,11 @@ vessel positions. Reads data/processed/dashboard/drift_{case}.json
 (src/attribution/score_vessels.py), writes src/dashboard/output/map.html
 (first case) / map_{case}.html (the rest).
 
+Add --anonymize to write to output_anon/ instead, with real ship_name/
+mmsi/imo replaced by fictional stand-ins in tooltips/popups -- see
+src/common/anonymize.py for why. Must match build_dashboard.py's
+--anonymize output directory so index.html's map iframe resolves.
+
 Dark navy/amber/teal theme matching the dashboard shell
 (build_dashboard.py) -- see DECISIONS.md "Dashboard visual redesign" for
 where this design language came from. Colors:
@@ -23,12 +28,16 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import folium
+import numpy as np
 from folium.plugins import Fullscreen
+from scipy.spatial import ConvexHull
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common.anonymize import anonymize_ranking  # noqa: E402
 from common.geo import haversine_km  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "processed" / "dashboard"
@@ -52,6 +61,13 @@ DARK_CHROME_CSS = """
   }
   .leaflet-popup-content { font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 12.5px; }
   .leaflet-popup-content b { color: #f4b95a; font-family: 'Chivo', system-ui, sans-serif; }
+  .leaflet-tooltip {
+    background: #0e1d2c; color: #eaf1f7; border: 1px solid #2c4d68;
+    font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 12px;
+    box-shadow: 0 6px 16px -6px rgba(0,0,0,.7);
+  }
+  .leaflet-tooltip-top:before, .leaflet-tooltip-bottom:before,
+  .leaflet-tooltip-left:before, .leaflet-tooltip-right:before { border-top-color: #2c4d68; }
   .leaflet-control-layers, .leaflet-bar {
     background: #0e1d2c !important; border: 1px solid #2c4d68 !important; color: #eaf1f7;
   }
@@ -198,6 +214,43 @@ def render_wind_vectors(source: dict) -> folium.FeatureGroup:
     return group
 
 
+def drift_cone_latlon(tracks: list) -> list[list[float]] | None:
+    """
+    Real "drift reconstruction cone" outline: the convex hull of every real
+    particle position at every real simulated timestep (not just the
+    endpoints), giving a single clean shape that honestly bounds the whole
+    swept advection area instead of drawing 50 individual thin lines --
+    simplifies the default view without hiding or approximating the
+    underlying physics (the raw per-particle tracks stay available as a
+    togglable layer, see build_map() below). Returns [[lat,lon], ...] (a
+    closed ring, first point repeated at the end) or None if there aren't
+    enough distinct points for a real hull (needs >=3).
+    """
+    points = np.array([[lon, lat] for track in tracks for lon, lat in track])
+    if len(points) < 3:
+        return None
+    try:
+        hull = ConvexHull(points)
+    except Exception:
+        return None  # degenerate (e.g. all points collinear) -- real edge case, not an error
+    ring = points[hull.vertices]
+    ring = np.vstack([ring, ring[0]])  # close the ring
+    return [[lat, lon] for lon, lat in ring]
+
+
+def ship_icon(color: str) -> folium.Icon:
+    """Real vessel positions get a ship glyph, not a generic dot -- see the
+    user-supplied reference mockup this map's redesign is matching."""
+    return folium.Icon(color=color, icon="ship", prefix="fa")
+
+
+def fmt_origin_time(detection_time_utc: str, hours_back: int) -> str:
+    """Real origin time = detection time - hours_back, formatted for the
+    map's persistent origin callout (e.g. '01 Jan 2019 · 03:42 UTC')."""
+    dt = datetime.fromisoformat(detection_time_utc.replace("Z", "+00:00")) - timedelta(hours=hours_back)
+    return dt.strftime("%d %b %Y · %H:%M UTC")
+
+
 def build_map(data: dict, ranking: dict | None) -> folium.Map:
     detection = data["detection_point"]
     m = folium.Map(location=[detection[1], detection[0]], zoom_start=11, tiles=None, control_scale=True)
@@ -216,6 +269,7 @@ def build_map(data: dict, ranking: dict | None) -> folium.Map:
     # the initial view to zoom out to fit it even though it starts hidden.
     bounds_points: list[list[float]] = []
 
+    geo_context = data.get("geo_context", "")
     folium.Marker(
         [detection[1], detection[0]],
         tooltip=f"Oil detection: {data['case']}",
@@ -223,12 +277,38 @@ def build_map(data: dict, ranking: dict | None) -> folium.Map:
             f"<b>Detection ({data['case']})</b><br>"
             f"{detection[1]:.4f}°N, {detection[0]:.4f}°E<br>"
             f"{data['detection_time_utc']}<br>"
-            f"Sentinel-1, Eastern Mediterranean",
-            max_width=250,
+            f"Sentinel-1{' · ' + geo_context if geo_context else ''}",
+            max_width=280,
         ),
         icon=folium.Icon(color="red", icon="tint", prefix="fa"),
     ).add_to(m)
     bounds_points.append([detection[1], detection[0]])
+
+    # Real detected-slick footprint -- the actual labeled-object bbox (PANGAEA
+    # metadata) used to seed advection particles, not a fabricated shape. Tiny
+    # (~1km) at this zoom, which is honest: it's a real, small, real-world slick
+    # extent, not exaggerated for visual effect.
+    bbox = data.get("detection_bbox")
+    if bbox:
+        lon_min, lon_max = bbox["lon_range"]
+        lat_min, lat_max = bbox["lat_range"]
+        folium.Rectangle(
+            [[lat_min, lon_min], [lat_max, lon_max]],
+            color=DETECTION_COLOR, weight=2, fill=True, fill_color=DETECTION_COLOR, fill_opacity=0.35,
+            tooltip="Detected slick (real labeled extent)",
+        ).add_to(m)
+        bounds_points += [[lat_min, lon_min], [lat_max, lon_max]]
+
+    if geo_context:
+        m.get_root().html.add_child(folium.Element(f"""
+<div style="position:absolute;top:12px;left:12px;z-index:1000;background:rgba(10,18,28,.92);
+            border:1px solid #2c4d68;border-radius:8px;padding:8px 12px;max-width:260px;
+            font-family:'IBM Plex Sans',system-ui,sans-serif;font-size:12px;color:#eaf1f7;
+            box-shadow:0 10px 24px -10px rgba(0,0,0,.7);backdrop-filter:blur(4px);">
+  <div style="font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:#93a8bc;
+              text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px;">Location</div>
+  {geo_context}
+</div>"""))
 
     centroids = {}
     for source in data["sources"]:
@@ -236,7 +316,24 @@ def build_map(data: dict, ranking: dict | None) -> folium.Map:
         color = SOURCE_COLORS[name]
         centroids[name] = source["centroid"]
 
-        tracks_group = folium.FeatureGroup(name=f"{name}: particle tracks ({data['n_particles']})", show=(name == "ERA5"))
+        # Default view: one clean "drift reconstruction cone" (real convex hull
+        # of every particle position at every timestep -- see
+        # drift_cone_latlon()) instead of 50 raw lines. The raw per-particle
+        # tracks are still real and still here, just off by default -- a
+        # togglable "inspect real tracks" layer for anyone who wants the detail,
+        # per the user's request for a simpler default view.
+        cone_ring = drift_cone_latlon(source["tracks"])
+        if cone_ring:
+            cone_group = folium.FeatureGroup(name=f"{name}: drift reconstruction cone", show=(name == "ERA5"))
+            folium.Polygon(
+                cone_ring, color=color, weight=1.5, opacity=0.7,
+                fill=True, fill_color=color, fill_opacity=0.18,
+                tooltip=f"{name}: real backward-drift spread envelope ({data['n_particles']} particles, {data['hours_back']}h)",
+            ).add_to(cone_group)
+            cone_group.add_to(m)
+            bounds_points += cone_ring
+
+        tracks_group = folium.FeatureGroup(name=f"{name}: raw particle tracks ({data['n_particles']})", show=False)
         for track in source["tracks"]:
             latlon_track = [[lat, lon] for lon, lat in track]
             folium.PolyLine(latlon_track, color=color, weight=1, opacity=0.4).add_to(tracks_group)
@@ -248,14 +345,75 @@ def build_map(data: dict, ranking: dict | None) -> folium.Map:
             bounds_points.append([lat, lon])
         points_group.add_to(m)
 
+        # Forward-forecast track -- same physics/color as the backward hindcast
+        # above (src/drift/advect.py forward_advect), drawn dashed rather than
+        # solid so the two are visually distinguishable at a glance: solid =
+        # reconstructed past (hindcast), dashed = predicted future (forecast).
+        # Per the SIH problem statement's "predict the future flow of the
+        # slick" -- see DECISIONS.md "Forward drift forecasting added".
+        if source.get("forecast_tracks"):
+            forecast_cone_ring = drift_cone_latlon(source["forecast_tracks"])
+            if forecast_cone_ring:
+                forecast_cone_group = folium.FeatureGroup(name=f"{name}: forecast cone (forward)", show=(name == "ERA5"))
+                folium.Polygon(
+                    forecast_cone_ring, color=color, weight=1.5, opacity=0.6, dash_array="4,6",
+                    fill=True, fill_color=color, fill_opacity=0.12,
+                    tooltip=f"{name}: real forward-forecast spread envelope ({data['n_particles']} particles, "
+                            f"{data.get('hours_forward', '?')}h)",
+                ).add_to(forecast_cone_group)
+                forecast_cone_group.add_to(m)
+                bounds_points += forecast_cone_ring
+
+            forecast_group = folium.FeatureGroup(
+                name=f"{name}: raw forecast tracks (forward, {data.get('hours_forward', '?')}h)", show=False
+            )
+            for track in source["forecast_tracks"]:
+                latlon_track = [[lat, lon] for lon, lat in track]
+                folium.PolyLine(latlon_track, color=color, weight=1.6, opacity=0.55, dash_array="4,6").add_to(forecast_group)
+            forecast_group.add_to(m)
+
+            forecast_points_group = folium.FeatureGroup(name=f"{name}: forecast final positions", show=(name == "ERA5"))
+            for lon, lat in source["forecast_final_positions"]:
+                folium.CircleMarker(
+                    [lat, lon], radius=2.5, color=color, fill=True, fill_opacity=0.35, weight=1.2, dash_array="2,3"
+                ).add_to(forecast_points_group)
+                bounds_points.append([lat, lon])
+            forecast_points_group.add_to(m)
+
+            folium.Marker(
+                [source["forecast_centroid"][1], source["forecast_centroid"][0]],
+                tooltip=f"{name} forecast (forward {data.get('hours_forward', '?')}h)",
+                popup=folium.Popup(
+                    f"<b>{name} forward forecast</b><br>"
+                    f"{source['forecast_centroid'][1]:.4f}°N, {source['forecast_centroid'][0]:.4f}°E<br>"
+                    f"{data.get('hours_forward', '?')}h forward, {data['n_particles']} particles<br>"
+                    f"spread: σlon={source['forecast_lon_std']:.4f}°, σlat={source['forecast_lat_std']:.4f}°",
+                    max_width=260,
+                ),
+                icon=folium.Icon(color="orange" if name == "ERA5" else "blue", icon="arrow-right", prefix="fa"),
+            ).add_to(m)
+            bounds_points.append([source["forecast_centroid"][1], source["forecast_centroid"][0]])
+
         render_wind_vectors(source).add_to(m)
 
+        origin_time_str = fmt_origin_time(data["detection_time_utc"], data["hours_back"])
+        # ERA5 (primary source) gets a permanent, always-visible callout -- matching
+        # the user-supplied reference mockup's persistent "Estimated Origin" box --
+        # instead of requiring a click. NCEP/NCAR (secondary/toggle source) keeps a
+        # click-to-open popup only, so two permanent boxes don't overlap by default.
         folium.Marker(
             [source["centroid"][1], source["centroid"][0]],
-            tooltip=f"{name} origin estimate",
+            tooltip=(
+                folium.Tooltip(
+                    f"<b>Estimated Origin</b><br>{origin_time_str}<br>"
+                    f"{source['centroid'][1]:.4f}°N, {source['centroid'][0]:.4f}°E",
+                    permanent=True, direction="top", sticky=False,
+                ) if name == "ERA5" else f"{name} origin estimate"
+            ),
             popup=folium.Popup(
                 f"<b>{name} origin estimate</b><br>"
                 f"{source['centroid'][1]:.4f}°N, {source['centroid'][0]:.4f}°E<br>"
+                f"{origin_time_str}<br>"
                 f"{data['hours_back']}h backward, {data['n_particles']} particles<br>"
                 f"spread: σlon={source['lon_std']:.4f}°, σlat={source['lat_std']:.4f}°",
                 max_width=260,
@@ -290,19 +448,29 @@ def build_map(data: dict, ranking: dict | None) -> folium.Map:
         vessels_group = folium.FeatureGroup(name=f"Candidate vessels (top {min(N_VESSEL_MARKERS, len(ranking['ranking']))})", show=True)
         for v in ranking["ranking"][:N_VESSEL_MARKERS]:
             is_top = v["rank"] == 1
-            color = TOP_SUSPECT_COLOR if is_top else CANDIDATE_COLOR
-            folium.CircleMarker(
+            # folium's built-in Icon only takes named colors (not arbitrary hex) --
+            # "orange" and "cadetblue" are the closest real matches to this theme's
+            # amber/teal for a real ship glyph (see ship_icon()).
+            icon_color = "orange" if is_top else "cadetblue"
+            ship_name = v["ship_name"] or "(unnamed)"
+            folium.Marker(
                 [v["lat"], v["lon"]],
-                radius=8 if is_top else 5,
-                color=color, weight=2, fill=True, fill_color=color, fill_opacity=0.35 if is_top else 0.6,
-                tooltip=f"#{v['rank']} {v['ship_name'] or '(unnamed)'} -- {v['confidence_pct']:.0f}% confidence",
+                # Top suspect gets a permanent label (real ship name), matching the
+                # user-supplied reference mockup's always-visible top-suspect marker --
+                # every other candidate stays hover-only so the default view isn't
+                # cluttered with N labels.
+                tooltip=(
+                    folium.Tooltip(f"★ {ship_name} — top suspect", permanent=True, direction="right")
+                    if is_top else f"#{v['rank']} {ship_name} -- {v['match_score_pct']:.0f}% match score"
+                ),
                 popup=folium.Popup(
-                    f"<b>#{v['rank']} {v['ship_name'] or '(unnamed)'}</b>{' &mdash; TOP SUSPECT' if is_top else ''}<br>"
+                    f"<b>#{v['rank']} {ship_name}</b>{' &mdash; TOP SUSPECT' if is_top else ''}<br>"
                     f"MMSI {v['mmsi'] or '-'} &middot; flag {v['flag'] or '-'}<br>"
                     f"{v['distance_km']:.1f} km from origin, {v['time_gap_hours']:.1f}h time gap<br>"
-                    f"confidence: {v['confidence_pct']:.0f}%",
+                    f"match score: {v['match_score_pct']:.0f}%",
                     max_width=260,
                 ),
+                icon=ship_icon(icon_color),
             ).add_to(vessels_group)
             bounds_points.append([v["lat"], v["lon"]])
         vessels_group.add_to(m)
@@ -314,7 +482,9 @@ def build_map(data: dict, ranking: dict | None) -> folium.Map:
 
 
 def main() -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    anonymize = "--anonymize" in sys.argv
+    out_dir = OUT_DIR.parent / "output_anon" if anonymize else OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     for i, case_id in enumerate(CASE_IDS):
         data_path = DATA_DIR / f"drift_{case_id.replace('-', '')}.json"
         ranking_path = DATA_DIR / f"vessel_ranking_{case_id.replace('-', '')}.json"
@@ -323,11 +493,13 @@ def main() -> None:
             continue
         data = json.loads(data_path.read_text())
         ranking = json.loads(ranking_path.read_text()) if ranking_path.exists() else None
+        if anonymize:
+            ranking = anonymize_ranking(ranking)
         m = build_map(data, ranking)
         out_name = "map.html" if i == 0 else f"map_{case_id.replace('-', '')}.html"
-        out_path = OUT_DIR / out_name
+        out_path = out_dir / out_name
         m.save(str(out_path))
-        print(f"wrote {out_path}")
+        print(f"wrote {out_path}{' (anonymized)' if anonymize else ''}")
 
 
 if __name__ == "__main__":
