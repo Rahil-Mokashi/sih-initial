@@ -81,6 +81,12 @@ def train(
     num_workers: int = 0,
     latest_checkpoint_path: str | Path | None = None,
     resume: bool = True,
+    use_lr_scheduler: bool = False,
+    lr_monitor: str = "val_loss",
+    lr_patience: int = 3,
+    lr_factor: float = 0.5,
+    lr_min: float = 1e-6,
+    sampler=None,
 ) -> TrainResult:
     """
     latest_checkpoint_path, if given, is overwritten after every epoch
@@ -93,13 +99,37 @@ def train(
     -- added so a long run (multi-GB VRAM, hours per epoch) surviving a
     laptop sleep/hibernate/crash costs at most one epoch, not everything
     already done. See LOG.md for why this was added.
+
+    use_lr_scheduler opts into a ReduceLROnPlateau (only when val_dataset
+    is given), monitoring `lr_monitor` ("val_loss", mode=min, or
+    "val_dice", mode=max). Off by default and deliberately separate from
+    loss-function choice: after the real 60-epoch run plateaued *below*
+    the trivial "predict all oil" Dice baseline (see LOG.md), the
+    diagnosed primary cause was pos_weight fighting Dice, not missing LR
+    decay -- so a loss-function trial should run with this off to isolate
+    that variable, while a pos_weight trial can turn it on. Scheduler
+    state is saved to latest_checkpoint_path and restored on resume.
+
+    sampler, if given (e.g. a WeightedRandomSampler from
+    detection.dataset.compute_oil_tile_weights), replaces `shuffle=True`
+    -- PyTorch's DataLoader disallows both at once. Added as a separate,
+    independently-testable lever from loss/pos_weight: most training
+    tiles have zero oil pixels (no_oil/lookalike images are 100% zero by
+    construction), which pos_weight cannot address since it only
+    reweights pixels within a tile that already has some oil.
     """
     model.to(device)
     model.train()
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler, num_workers=num_workers)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scheduler = None
+    if use_lr_scheduler and val_dataset is not None:
+        mode = "max" if lr_monitor == "val_dice" else "min"
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode=mode, factor=lr_factor, patience=lr_patience, min_lr=lr_min
+        )
 
     result = TrainResult()
     start_epoch = 1
@@ -110,6 +140,8 @@ def train(
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if use_amp and ckpt.get("scaler_state_dict"):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
+        if scheduler is not None and ckpt.get("scheduler_state_dict"):
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         result.best_val_dice = ckpt.get("best_val_dice")
         result.best_epoch = ckpt.get("best_epoch")
@@ -152,13 +184,20 @@ def train(
         val_loss, val_dice = (None, None)
         if val_dataset is not None:
             val_loss, val_dice = evaluate(model, val_dataset, loss_fn, device, batch_size=batch_size, num_workers=num_workers)
+            if scheduler is not None:
+                lr_before = optimizer.param_groups[0]["lr"]
+                scheduler.step(val_dice if lr_monitor == "val_dice" else val_loss)
+                lr_after = optimizer.param_groups[0]["lr"]
+                if lr_after < lr_before:
+                    print(f"  {lr_monitor} plateaued -> lr {lr_before:.2e} -> {lr_after:.2e}")
 
         stats = EpochStats(epoch=epoch, loss=avg_loss, seconds=elapsed, peak_vram_mb=peak_vram_mb,
                             val_loss=val_loss, val_dice=val_dice)
         result.history.append(stats)
         vram_str = f"{peak_vram_mb:.0f}MB" if peak_vram_mb is not None else "n/a"
         val_str = f"  val_loss={val_loss:.4f}  val_dice={val_dice:.4f}" if val_dataset is not None else ""
-        print(f"epoch {epoch}/{epochs}  loss={avg_loss:.4f}  time={elapsed:.1f}s  peak_vram={vram_str}{val_str}")
+        lr_str = f"  lr={optimizer.param_groups[0]['lr']:.2e}"
+        print(f"epoch {epoch}/{epochs}  loss={avg_loss:.4f}  time={elapsed:.1f}s  peak_vram={vram_str}{val_str}{lr_str}")
 
         if val_dataset is not None and (result.best_val_dice is None or val_dice > result.best_val_dice):
             result.best_val_dice = val_dice
@@ -181,6 +220,7 @@ def train(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scaler_state_dict": scaler.state_dict() if use_amp else None,
+                "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                 "epoch": epoch,
                 "best_val_dice": result.best_val_dice,
                 "best_epoch": result.best_epoch,

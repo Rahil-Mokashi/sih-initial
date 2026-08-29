@@ -7,11 +7,13 @@ touched during training) with a decent amount of real oil and a 512x512
 window that actually contains it, so the demo isn't just blank water and
 isn't an image the model may have already seen during training.
 
-Output: data/processed/dashboard/detection_overlay.png
+Output: data/processed/dashboard/detection_overlay.png,
+        data/processed/dashboard/detection_geometry.json
 
 Usage: venv\\Scripts\\python.exe scripts\\render_detection_overlay.py
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -24,6 +26,7 @@ import torch
 from rasterio.windows import Window
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from detection.geometry import characterize_mask  # noqa: E402
 from detection.inference import load_model_for_inference, predict_mask  # noqa: E402
 from detection.preprocess import lee_filter, normalize_db_fixed  # noqa: E402
 
@@ -32,6 +35,14 @@ IMG_DIR = REPO_ROOT / "data" / "raw" / "zenodo_sar_oil_spill_part3" / "images_ex
 MASK_DIR = REPO_ROOT / "data" / "raw" / "zenodo_sar_oil_spill_part3" / "masks_extracted" / "Mask" / "Oil"
 CHECKPOINT_PATH = REPO_ROOT / "data" / "processed" / "checkpoints" / "best_unet_resnet18.pt"
 OUT_PATH = REPO_ROOT / "data" / "processed" / "dashboard" / "detection_overlay.png"
+GEOMETRY_OUT_PATH = REPO_ROOT / "data" / "processed" / "dashboard" / "detection_geometry.json"
+
+# No pixel_size_m is passed to characterize_mask() below -- checked directly
+# against the Zenodo dataset's own record page (DOI 10.5281/zenodo.8346860)
+# and it does not state a Sentinel-1 product type or ground resolution for
+# these images, unlike the PANGAEA drift cases (confirmed IW GRDH product
+# IDs -- see DECISIONS.md). Reporting pixel-unit geometry only here rather
+# than assuming a resolution this dataset never actually documented.
 
 TILE_SIZE = 512
 MIN_OIL_FRACTION = 0.05  # pick an image with at least 5% oil for a meaningful demo
@@ -76,6 +87,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model_for_inference(CHECKPOINT_PATH, device)
     pred_tile = predict_mask(model, raw_tile, device)
+
+    gt_geometry = characterize_mask(gt_tile)
+    pred_geometry = characterize_mask(pred_tile)
+    print(f"real ground-truth geometry: {gt_geometry}")
+    print(f"model prediction geometry: {pred_geometry}")
+    GEOMETRY_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GEOMETRY_OUT_PATH.write_text(json.dumps(
+        {"demo_image": image_path.name, "ground_truth": gt_geometry, "prediction": pred_geometry}, indent=2
+    ))
+    print(f"wrote {GEOMETRY_OUT_PATH}")
 
     despeckled_display = normalize_db_fixed(lee_filter(raw_tile))
 

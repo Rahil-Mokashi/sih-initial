@@ -20,6 +20,44 @@ full writeup, including known limitations):
     documented scale constants -- NOT validated against any labeled ground
     truth (none exists yet for this project), so treat the ranking as a
     reasonable first-pass ordering to inspect, not a calibrated probability.
+
+Extended per the SIH problem statement's explicit ask for trajectory and
+behavioural-anomaly scoring, not just proximity+timing (see DECISIONS.md
+"Attribution scoring: behavioral-anomaly (AIS gap) sub-score" for the
+real GFW API test that determined what's actually buildable):
+  - trajectory evidence (n_presence_records, closest_approach_km) comes
+    from the SAME presence records already fetched for the top-N
+    candidates -- not a new API call. score_vessels() above still keeps
+    only each vessel's single closest-in-time row; trajectory_evidence()
+    below looks at ALL of that vessel's real rows in the query window to
+    see whether its track came even closer to the origin at some other
+    point, which the single closest-in-time row alone can't show.
+  - behavioral-anomaly evidence is a real AIS-gap check via GFW's
+    v3/events API (gaps dataset), confirmed by direct real-token test to
+    return `intentionalDisabling` (GFW's own suspected-deliberate-shutoff
+    flag), duration, and distance per gap -- this is genuinely available
+    and implemented as `composite_score`, a SEPARATE field alongside the
+    original `score`, not blended into it silently.
+  - composite_score is computed against the FULL raw candidate pool (all
+    355-1006+ vessels depending on case), not just a distance+timing
+    pre-filtered top-N -- this was originally scoped to only the top 15
+    (behavioral checks looked like they'd cost one GFW call per vessel),
+    but a real, un-documented finding changed that: v3/events' `vessels[]`
+    filter accepts up to 20 vessel IDs per request (confirmed by direct
+    binary-search test -- 20 succeeds, 21 returns a real 422), so checking
+    the entire pool costs ceil(n_candidates / 20) requests, not
+    n_candidates -- ~18 for a 355-vessel pool, ~51 for a 1006-vessel one.
+    Trivial against the real 50,000/day quota. See gfw_client.py's
+    `fetch_gap_events_batch()` and DECISIONS.md "Full-pool behavioral
+    rescoring" for the real numbers and why the earlier top-15-only
+    version was a real selection-bias risk (a vessel with a genuine AIS
+    gap but middling proximity/timing would never have been checked).
+  - course/heading and instantaneous per-position speed, which the
+    problem statement's "trajectory" language could also suggest, were
+    checked directly against real GFW v3/events responses (all 5 event
+    types) and are NOT present in any event schema at this API tier --
+    a confirmed external constraint, not something this implementation
+    skipped.
 """
 
 from __future__ import annotations
@@ -31,7 +69,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from attribution.gfw_client import fetch_vessel_presence  # noqa: E402
+from attribution.gfw_client import (  # noqa: E402
+    MAX_VESSELS_PER_EVENTS_REQUEST, GFWError, fetch_gap_events_batch, fetch_vessel_presence,
+)
 from common.geo import haversine_km  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "processed" / "dashboard"
@@ -51,6 +91,16 @@ DISTANCE_SCALE_KM = 50.0   # distance at which the proximity term saturates to 1
 TIME_SCALE_HOURS = 24.0    # time gap at which the timing term saturates to 1.0 -- matches the drift window
 DISTANCE_WEIGHT = 0.5
 TIME_WEIGHT = 0.5
+
+# Behavioral-anomaly (AIS gap) adjustment -- subtracted from `score` to
+# produce `composite_score` (lower score = more consistent with being the
+# source, same convention as distance/time above). An intentional AIS gap
+# is a real, well-recognized "went dark" red flag; an unflagged gap is
+# weaker evidence (could be a real receiver blackspot, not deliberate) so
+# gets a smaller bonus. Documented, not tuned -- same honesty as the
+# distance/time scales above.
+GAP_INTENTIONAL_BONUS = 0.15
+GAP_ANY_BONUS = 0.05
 
 TOP_N = 15
 
@@ -122,6 +172,48 @@ def score_vessels(origin: tuple[float, float], origin_time: datetime, records: l
     return sorted(best_by_vessel.values(), key=lambda v: v.score)
 
 
+def trajectory_evidence(records: list[dict], vessel_id: str, origin: tuple[float, float]) -> dict:
+    """
+    Real trajectory-consistency evidence for one vessel, from ALL of its
+    presence rows in the query window (not just the single closest-in-time
+    row score_vessels() keeps). See module docstring for why this
+    substitutes for a true continuous track, which GFW's API doesn't
+    expose at this tier.
+    """
+    distances = [
+        haversine_km(origin, (r["lon"], r["lat"]))
+        for r in records
+        if r.get("vesselId") == vessel_id
+    ]
+    return {
+        "n_presence_records": len(distances),
+        "closest_approach_km": round(min(distances), 2) if distances else None,
+    }
+
+
+def behavior_evidence(events: list[dict]) -> dict:
+    """
+    Real AIS-gap behavioral-anomaly evidence for one vessel, from its real
+    gap events (already fetched in bulk for the whole candidate pool by
+    gfw_client.fetch_gap_events_batch -- see score_case()). Returns the
+    single longest-duration gap event if any exist (a vessel could have
+    several; the most sustained one is the most evidentially interesting),
+    or a real "no gap" result -- never fabricated.
+    """
+    if not events:
+        return {"ais_gap_count": 0, "ais_gap_intentional": None,
+                "ais_gap_duration_hours": None, "ais_gap_distance_km": None}
+
+    longest = max(events, key=lambda e: e.get("gap", {}).get("durationHours", 0) or 0)
+    gap = longest.get("gap", {})
+    return {
+        "ais_gap_count": len(events),
+        "ais_gap_intentional": gap.get("intentionalDisabling"),
+        "ais_gap_duration_hours": gap.get("durationHours"),
+        "ais_gap_distance_km": float(gap["distanceKm"]) if gap.get("distanceKm") is not None else None,
+    }
+
+
 def score_case(case_id: str) -> None:
     drift_path = DATA_DIR / f"drift_{case_id.replace('-', '')}.json"
     out_path = DATA_DIR / f"vessel_ranking_{case_id.replace('-', '')}.json"
@@ -155,10 +247,47 @@ def score_case(case_id: str) -> None:
     ranked = score_vessels(origin, origin_time, records)
     print(f"{len(ranked)} unique candidate vessels\n")
 
-    top = ranked[:TOP_N]
-    for i, v in enumerate(top, 1):
+    # Behavioral evidence is checked against the FULL raw candidate pool, not
+    # just a distance+timing pre-filtered top-N -- a real, un-documented API
+    # finding (v3/events' vessels[] filter accepts up to
+    # gfw_client.MAX_VESSELS_PER_EVENTS_REQUEST=20 IDs per request, confirmed by
+    # direct binary-search test) makes this cheap: ceil(n/20) requests for the
+    # whole pool, not n. Checking only a pre-filtered top-N was a real
+    # selection-bias risk -- a vessel with a genuine AIS gap but middling
+    # proximity/timing would never have been checked at all. See DECISIONS.md
+    # "Full-pool behavioral rescoring".
+    all_vessel_ids = [v.vessel_id for v in ranked]
+    n_batches = -(-len(all_vessel_ids) // MAX_VESSELS_PER_EVENTS_REQUEST)  # ceil div
+    print(f"fetching real AIS-gap behavioral evidence for all {len(ranked)} candidates "
+          f"({n_batches} batched GFW requests, {MAX_VESSELS_PER_EVENTS_REQUEST} vessels/request)...")
+    try:
+        gap_events_by_vessel = fetch_gap_events_batch(all_vessel_ids, date_range)
+    except GFWError as e:
+        print(f"  WARNING: gap-events fetch failed ({e}) -- falling back to no behavioral evidence for this case.")
+        gap_events_by_vessel = {}
+
+    enriched = []
+    for v in ranked:
+        traj = trajectory_evidence(records, v.vessel_id, origin)
+        behavior = behavior_evidence(gap_events_by_vessel.get(v.vessel_id, []))
+        bonus = GAP_INTENTIONAL_BONUS if behavior.get("ais_gap_intentional") else (
+            GAP_ANY_BONUS if behavior.get("ais_gap_count") else 0.0
+        )
+        composite_score = max(v.score - bonus, 0.0)
+        enriched.append((v, traj, behavior, composite_score))
+
+    enriched.sort(key=lambda row: row[3])  # re-rank the FULL pool by composite_score
+
+    n_with_gaps = sum(1 for _, _, behavior, _ in enriched if behavior.get("ais_gap_count"))
+    print(f"{n_with_gaps} of {len(enriched)} candidates had a real AIS gap event in the window\n")
+
+    top_enriched = enriched[:TOP_N]  # final displayed ranking, now selected AFTER full-pool behavioral scoring
+    for i, (v, traj, behavior, composite_score) in enumerate(top_enriched, 1):
+        gap_note = (f"GAP(intentional={behavior['ais_gap_intentional']}, n={behavior['ais_gap_count']})"
+                    if behavior.get("ais_gap_count") else "no AIS gap")
         print(f"{i:2d}. {v.ship_name or '(unnamed)':<20} MMSI={v.mmsi:<12} flag={v.flag:<4} "
-              f"dist={v.distance_km:6.1f}km  time_gap={v.time_gap_hours:5.1f}h  score={v.score:.3f}")
+              f"dist={v.distance_km:6.1f}km  time_gap={v.time_gap_hours:5.1f}h  score={v.score:.3f}  "
+              f"composite={composite_score:.3f}  {gap_note}  closest_approach={traj['closest_approach_km']}km")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     output = {
@@ -167,10 +296,18 @@ def score_case(case_id: str) -> None:
         "methodology": {
             "distance_scale_km": DISTANCE_SCALE_KM, "time_scale_hours": TIME_SCALE_HOURS,
             "distance_weight": DISTANCE_WEIGHT, "time_weight": TIME_WEIGHT,
+            "gap_intentional_bonus": GAP_INTENTIONAL_BONUS, "gap_any_bonus": GAP_ANY_BONUS,
             "note": "First-pass heuristic scoring, not calibrated against labeled ground truth. "
-                    "Lower score = more consistent with being the spill source.",
+                    "Lower score = more consistent with being the spill source. `score` is "
+                    "proximity+timing only (the original methodology); `composite_score` additionally "
+                    "factors in real AIS-gap behavioral evidence and is what the ranking below is sorted "
+                    "by. Behavioral/trajectory evidence is checked against the FULL candidate pool "
+                    "(n_candidates below), not just the vessels shown -- see "
+                    "src/attribution/score_vessels.py module docstring and DECISIONS.md 'Full-pool "
+                    "behavioral rescoring' for the real per-case request counts this took.",
         },
         "n_candidates": len(ranked),
+        "n_candidates_with_ais_gap": n_with_gaps,
         "ranking": [
             {
                 "rank": i + 1, "vessel_id": v.vessel_id, "mmsi": v.mmsi, "imo": v.imo,
@@ -180,11 +317,26 @@ def score_case(case_id: str) -> None:
                 "evidence_date": v.evidence_date, "entry_timestamp": v.entry_timestamp,
                 "exit_timestamp": v.exit_timestamp, "hours_present": v.hours_present,
                 "score": round(v.score, 4),
+                "composite_score": round(composite_score, 4),
                 # Derived, not an independently-measured probability -- see
-                # methodology.note above. confidence_pct = (1 - score) * 100.
-                "confidence_pct": round((1 - min(v.score, 1.0)) * 100, 1),
+                # methodology.note above. Named match_score_pct (not "confidence")
+                # deliberately: this is an uncalibrated composite, not a probability
+                # of guilt, and "confidence" reads as calibrated to anyone skimming
+                # the dashboard. match_score_pct = (1 - composite_score) * 100.
+                "match_score_pct": round((1 - min(composite_score, 1.0)) * 100, 1),
+                # Trajectory evidence: real, from this vessel's OTHER presence rows in the
+                # window (see trajectory_evidence() docstring) -- not a new API call.
+                "n_presence_records": traj["n_presence_records"],
+                "closest_approach_km": traj["closest_approach_km"],
+                # Behavioral-anomaly evidence: real AIS-gap check via GFW v3/events (see
+                # behavior_evidence() docstring). ais_gap_intentional is GFW's own
+                # suspected-deliberate-shutoff flag, None if no gap event exists at all.
+                "ais_gap_count": behavior["ais_gap_count"],
+                "ais_gap_intentional": behavior["ais_gap_intentional"],
+                "ais_gap_duration_hours": behavior["ais_gap_duration_hours"],
+                "ais_gap_distance_km": behavior["ais_gap_distance_km"],
             }
-            for i, v in enumerate(top)
+            for i, (v, traj, behavior, composite_score) in enumerate(top_enriched)
         ],
     }
     out_path.write_text(json.dumps(output, indent=2))

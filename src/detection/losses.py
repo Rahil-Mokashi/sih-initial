@@ -45,3 +45,33 @@ class DiceBCELoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         return self.dice_weight * dice_loss(logits, targets) + self.bce_weight * self.bce(logits, targets)
+
+
+class TverskyLoss(nn.Module):
+    """
+    Generalizes Dice with independent false-positive/false-negative weights
+    (alpha, beta) instead of Dice's implicit 0.5/0.5 -- added as a
+    DiceBCELoss alternative after the real 60-epoch run plateaued well
+    *below* the trivial "predict all oil" baseline (val_dice ~0.022-0.0235
+    vs. ~0.058 at the real 2.98% oil fraction), pointing at pos_weight=32.6
+    double-correcting for class imbalance on top of Dice and pushing the
+    model toward a low-confidence degenerate solution (see LOG.md). beta >
+    alpha (default 0.3/0.7) weights false negatives more than false
+    positives -- the direction a 3%-positive, currently under-predicting
+    class needs.
+    """
+
+    def __init__(self, alpha: float = 0.3, beta: float = 0.7, eps: float = 1e-6):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits).flatten(1)
+        targets = targets.flatten(1)
+        tp = (probs * targets).sum(dim=1)
+        fp = (probs * (1 - targets)).sum(dim=1)
+        fn = ((1 - probs) * targets).sum(dim=1)
+        tversky = (tp + self.eps) / (tp + self.alpha * fp + self.beta * fn + self.eps)
+        return 1 - tversky.mean()
