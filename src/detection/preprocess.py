@@ -79,7 +79,15 @@ def lee_filter(image: np.ndarray, window_size: int = 7) -> np.ndarray:
     Standard formulation: output = mean + k * (pixel - mean), where k is a
     per-pixel weight derived from local vs. estimated noise variance, so
     flat/homogeneous areas get smoothed hard and edges are preserved.
+
+    image may be (H, W) (single-band) or (C, H, W) (e.g. the real VV+VH
+    dual-pol bands in the Zenodo GeoTIFFs) -- each channel is despeckled
+    independently since Lee's local-variance weighting is per-band by
+    construction (VV and VH have different noise/backscatter statistics).
     """
+    if image.ndim == 3:
+        return np.stack([lee_filter(image[c], window_size) for c in range(image.shape[0])])
+
     image = image.astype(np.float32)
     mean = uniform_filter(image, size=window_size)
     mean_sq = uniform_filter(image ** 2, size=window_size)

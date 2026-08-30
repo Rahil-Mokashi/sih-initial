@@ -111,12 +111,24 @@ class ZenodoTileDataset(Dataset):
         stride: int | None = None,
         augment: bool = False,
         seed: int = 0,
+        channels: tuple[int, ...] = (1,),
     ):
+        """
+        channels selects which 1-indexed rasterio bands to read, e.g. (1,)
+        for the original single-band (VV) setup or (1, 2) for both real SAR
+        bands the Zenodo GeoTIFFs carry (confirmed via direct inspection --
+        distinct dB ranges per band, not a duplicate). Defaults to (1,) so
+        existing callers (sanity checks, anything not passing this
+        explicitly) keep the exact prior single-channel behavior;
+        scripts/train_detection.py's --channels flag is what actually opts
+        into dual-channel training.
+        """
         self.tile_size = tile_size
         self.stride = stride or tile_size
         self.augment = augment
         self.rng = np.random.default_rng(seed)
         self.pairs = pairs
+        self.channels = channels
 
         self.index: list[tuple[int, int, int]] = []  # (pair_idx, row_off, col_off)
         for i, pair in enumerate(pairs):
