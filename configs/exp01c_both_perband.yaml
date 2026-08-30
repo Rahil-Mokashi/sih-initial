@@ -1,0 +1,98 @@
+# Experiment 01c: both real SAR bands, per-band normalization, in_channels=2.
+#
+# Part of a four-point comparison against the epoch-39 baseline (real
+# oil-tiles-only IoU 0.1074 at threshold 0.35, precision 0.139, recall
+# 0.476 -- see docs/metric_audit.md; NOT re-trained, that number is already
+# measured). The other two trained arms are exp01a_band1_perband.yaml
+# (Band 1 alone) and exp01b_band2_perband.yaml (Band 2 alone).
+#
+# Every setting below is inherited UNCHANGED from configs/baseline.yaml
+# except `in_channels`/`channels` (2 / [1, 2] -- the whole point of this
+# arm) and `normalization`, `seed`, `experiment_name`, and `output_dir`.
+# See baseline.yaml for the provenance of every inherited value
+# (pos_weight, learning_rate, batch_size, epochs, no scheduler, etc.) --
+# pos_weight in particular is UNCHANGED at 32.6 even though it was derived
+# from single-channel training; this arm isolates channel count as the one
+# variable, not pos_weight retuning (that would be a different, separately
+# justified experiment -- see the ground rules against bundling changes).
+#
+# MUST PIN to a commit that includes commit 17a8845 ("Add config-driven
+# training entrypoint + Colab reproducibility infra") or later --
+# REQUIRED for this arm specifically: the earlier c70349a's
+# ZenodoTileDataset.__getitem__ never actually used the `channels` param,
+# so in_channels=2 would either crash or silently train on malformed
+# tensors under that commit. Confirmed fixed and verified working
+# end-to-end as of 17a8845 (see LOG.md's 2026-08-31 entry and this
+# experiment's own pre-flight check). run_manifest.json records whatever
+# the actual HEAD SHA is at run time; confirm via
+# `git merge-base --is-ancestor 17a8845 HEAD` that it descends from the fix
+# before trusting this run's results.
+
+experiment_name: exp01c_both_perband
+
+in_channels: 2
+channels: [1, 2]
+
+sampling_strategy: none
+oil_tile_fraction: null
+
+pos_weight: 32.6
+
+loss: dicebce
+loss_parameters:
+  dice_weight: 1.0
+  bce_weight: 1.0
+
+optimizer: adam
+learning_rate: 0.001
+weight_decay: 0.0
+
+scheduler: none
+scheduler_parameters: {}
+
+batch_size: 16
+grad_accum_steps: 1
+num_workers: 6
+epochs: 60
+keep_last_n: 3
+
+# Explicit seed (baseline.yaml has none -- no global seed was ever set for
+# the original epoch-39 run, see its MANIFEST.json). This is a NECESSARY
+# difference from epoch-39, not an oversight: without it this experiment
+# itself wouldn't be reproducible, and there is no "epoch-39's seed" to
+# match since none existed. Same seed used across all three exp01 arms so
+# the ONLY difference between them is genuinely the input channels/
+# normalization, not incidental RNG divergence.
+seed: 42
+deterministic: false
+
+resume_from: null
+output_dir: data/processed/checkpoints/exp01c_both_perband
+
+allow_dirty: false
+
+tile_size: 512
+lee_filter:
+  window_size: 7
+
+normalization:
+  # Per-band ranges for BOTH bands, each its own empirical [p1, p99] in dB
+  # (measured over a 40-image sample -- see the metric_audit.md follow-up
+  # verification), applied in channel order [Band 1, Band 2] matching
+  # `channels: [1, 2]` above. NOT the shared [-40, 10] baseline.yaml uses.
+  mode: fixed_range
+  fixed_range:
+    - [-43.673, 0.0]
+    - [-33.821, 0.0]
+
+augmentation:
+  enabled: true
+  flips: true
+  rotations_90: true
+  speckle_jitter_std_db: 0.5
+
+dataset:
+  train_manifest: data/processed/train_manifest.csv
+  val_manifest: data/processed/val_manifest.csv
+  split_seed: 0
+  val_fraction: 0.15

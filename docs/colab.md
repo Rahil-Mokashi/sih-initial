@@ -62,13 +62,46 @@ record the actual installed versions in that run's `run_manifest.json`
 experiment -- don't present a mismatched-version run as directly comparable
 to 0.1057 without that caveat.
 
-## Dataset: downloaded fresh each session, not staged via Drive
+## Dataset: cached on Drive after the first download, timed either way
 
-Cell 5 re-downloads the Zenodo dataset directly (public, no auth needed)
-onto Colab's local disk every session, rather than requiring you to
-pre-upload a ~38GB archive to Drive. This trades a slower cell-5 (however
-long the Zenodo download takes) for zero one-time setup burden. If repeated
-downloads become the bottleneck, the next step would be caching the
-already-tiled/extracted data on Drive and reading from there instead --
-not built yet, since Phase 1 doesn't require it and it's easy to add later
-without touching anything else in this notebook.
+Cell 5 downloads the Zenodo dataset directly (public, no auth needed) the
+FIRST time it runs, then tars the extracted result (per-image GeoTIFFs +
+`train_manifest.csv`/`val_manifest.csv` -- there's no separate "tiles"
+artifact to cache, since `ZenodoTileDataset` reads 512x512 windows on the
+fly at train time rather than materializing them to disk) and writes it to
+`DRIVE_PROJECT_DIR/dataset_cache/zenodo_extracted.tar`. Every subsequent
+run (including after a Colab disconnect kills the session mid-training)
+checks that path first and extracts from there instead of re-downloading.
+
+**Set `FORCE_FRESH_DOWNLOAD = True`** in cell 0 to bypass the cache
+entirely -- e.g. if the download/extract scripts change, or you suspect the
+cached archive is stale or corrupt. There is no automatic staleness
+check; this flag is the only invalidation mechanism.
+
+**Real cost is measured, not assumed** -- cell 5 prints elapsed wall time
+and data volume for whichever path it actually took (`source=Drive cache`
+or `source=Zenodo (fresh download)`), plus a per-step breakdown for the
+fresh-download path. Record the first real number of each kind here once
+you have it:
+
+| path | elapsed | data volume |
+|---|---|---|
+| fresh download + extract + build + write cache | *(fill in after first real run)* | *(fill in)* |
+| Drive cache hit (copy + extract) | *(fill in after first real run)* | *(fill in)* |
+
+**Before relying on this, know the real constraint it runs into**: the
+combined Part I+II+III extracted dataset is on the order of ~94GB
+(README's documented ~38GB Part I images archive alone, plus Part II's
+~23GB+23GB and Part III's ~10GB). A tar of the extracted (uncompressed
+float32 GeoTIFF) result is comparable in size, not smaller -- SAR
+backscatter data doesn't compress well, which is also why cell 5 tars
+without gzip (`tarfile.open(..., 'w')` not `'w:gz'`): compression would
+just cost CPU time for negligible size reduction. **A free Google Drive
+account only gets 15GB of storage** -- nowhere near enough to hold this
+cache. If your Drive is on the free tier, `FORCE_FRESH_DOWNLOAD` effectively
+has to stay `True` (the cache write in cell 5 will fail or fill your Drive
+long before finishing), and the fresh-download path's own timing numbers
+above are what actually matters for planning around Colab disconnects --
+not the cache. This wasn't sized down further (e.g. caching only Part I)
+without being asked to, since which parts you actually need depends on the
+experiment.
