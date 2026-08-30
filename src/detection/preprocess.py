@@ -115,6 +115,38 @@ def normalize_db_fixed(image: np.ndarray, lo: float = EXPECTED_DB_RANGE[0], hi: 
     return ((clipped - lo) / (hi - lo)).astype(np.float32)
 
 
+def normalize_db_per_channel(image: np.ndarray, ranges: list[tuple[float, float]]) -> np.ndarray:
+    """
+    Like normalize_db_fixed, but supports a DIFFERENT fixed clip range per
+    band -- added after Phase 0's Gate C visual/numeric audit
+    (docs/metric_audit.md) found the single shared (-40, 10) dB range
+    normalize_db_fixed uses is well-centered for Band 2 (median normalized
+    value ~0.40) but badly compressed for Band 1 (median ~0.13, 31% of
+    pixels below 0.10) -- Band 1 and Band 2 have different real dB
+    distributions (means ~-31dB vs ~-19.6dB in a real sample) and clipping
+    them to the same window doesn't fit both.
+
+    If a single range is given, it's broadcast to every channel -- this is
+    what reproduces normalize_db_fixed's exact original behavior for the
+    single-channel (in_channels=1) baseline config, so configs/baseline.yaml
+    stays a faithful reproduction of the epoch-39 run.
+
+    image: (H, W) or (C, H, W). ranges: list of (lo, hi) tuples, either
+    length 1 (broadcast) or matching the number of channels.
+    """
+    if image.ndim == 2:
+        lo, hi = ranges[0]
+        return normalize_db_fixed(image, lo=lo, hi=hi)
+
+    n_channels = image.shape[0]
+    if len(ranges) == 1:
+        ranges = ranges * n_channels
+    if len(ranges) != n_channels:
+        raise ValueError(f"got {len(ranges)} normalization ranges for {n_channels} channels -- "
+                          f"pass either 1 (broadcast to all channels) or exactly {n_channels}")
+    return np.stack([normalize_db_fixed(image[c], lo=ranges[c][0], hi=ranges[c][1]) for c in range(n_channels)])
+
+
 def tile_image(image: np.ndarray, tile_size: int = 256, stride: int | None = None) -> list[np.ndarray]:
     """
     Cut `image` into tile_size x tile_size patches. Partial edge tiles are

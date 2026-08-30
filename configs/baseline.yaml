@@ -1,0 +1,77 @@
+# Reproduces the epoch-39 checkpoint's configuration as closely as the
+# repository and LOG.md permit -- see checkpoints/baseline_epoch39/MANIFEST.json
+# for the full provenance every value below was reconstructed from (not
+# guessed). Fields explicitly marked UNKNOWN / NEEDS VERIFICATION could not
+# be determined from any recorded source.
+#
+# Running this config from scratch will NOT reproduce epoch-39 bit-for-bit
+# (see `seed` below -- the original run set no global seed at all), but it
+# reproduces every hyperparameter and preprocessing choice that WAS
+# recorded, so any future run using this file is a fair comparison point
+# going forward.
+
+experiment_name: baseline_epoch39_reproduction
+
+in_channels: 1
+channels: [1]              # 1-indexed rasterio bands to read; [1] = the original single-band (Band 1) setup
+
+sampling_strategy: none     # epoch-39 used no oil-tile oversampling
+oil_tile_fraction: null     # only read when sampling_strategy: oil_aware
+
+pos_weight: 32.6            # empirical, from scripts/compute_mask_class_balance.py (real oil-pixel fraction 2.98% -> (1-0.0298)/0.0298)
+
+loss: dicebce
+loss_parameters:
+  dice_weight: 1.0
+  bce_weight: 1.0
+
+optimizer: adam             # the only optimizer train.py currently supports -- see its module docstring
+learning_rate: 0.001
+weight_decay: 0.0           # UNKNOWN / NEEDS VERIFICATION as an explicit choice -- no weight_decay was ever set; this is Adam's own default, not a verified original value
+
+scheduler: none              # epoch-39 itself never used a scheduler -- ReduceLROnPlateau was only added AFTER resuming past this exact checkpoint (see LOG.md, 2026-08-27)
+scheduler_parameters: {}
+
+batch_size: 16               # auto-probed by the original scripts/train_detection.py, confirmed selected in LOG.md (3235MB peak VRAM at this size)
+grad_accum_steps: 1
+num_workers: 6               # raised from 0 after epoch 1 was confirmed I/O-bound, not GPU-bound (LOG.md 2026-08-25)
+epochs: 60                   # extended mid-run from an initial 30 -- see MANIFEST.json note; epoch 39 is a point partway through, not a run that ever targeted exactly 39
+keep_last_n: 3
+
+seed: null                   # UNKNOWN / NEEDS VERIFICATION -- CONFIRMED no global torch.manual_seed / np.random.seed / random.seed call exists anywhere in the original code (direct grep). Set an explicit integer for any NEW run you want to be able to reproduce.
+deterministic: false
+
+resume_from: null            # set to checkpoints/baseline_epoch39/unet_resnet18_epoch39.pt to warm-start a NEW experiment from this exact checkpoint
+output_dir: data/processed/checkpoints/baseline_repro
+
+allow_dirty: false
+
+tile_size: 512
+lee_filter:
+  window_size: 7             # src/detection/preprocess.py's lee_filter default, applied per-tile (not per full image -- see DECISIONS.md for why)
+
+normalization:
+  # Amendment 2: per-band normalization support. mode: fixed_range takes one
+  # (lo, hi) dB range per channel; a single range broadcasts to every
+  # channel. The single [-40, 10] range below is the ORIGINAL shared
+  # constant from src/detection/preprocess.py's normalize_db_fixed, kept
+  # exactly as-is here so this config reproduces epoch-39's preprocessing
+  # exactly. Phase 0 Gate C found this range compresses Band 1's real
+  # dynamic range badly (median normalized value 0.13 vs Band 2's 0.40) --
+  # see docs/metric_audit.md -- but fixing that is Experiment 01's question
+  # to answer with a real comparison, not something to silently change here.
+  mode: fixed_range
+  fixed_range:
+    - [-40.0, 10.0]
+
+augmentation:
+  enabled: true
+  flips: true
+  rotations_90: true
+  speckle_jitter_std_db: 0.5
+
+dataset:
+  train_manifest: data/processed/train_manifest.csv
+  val_manifest: data/processed/val_manifest.csv
+  split_seed: 0               # scripts/build_training_pool.py's SPLIT_SEED
+  val_fraction: 0.15

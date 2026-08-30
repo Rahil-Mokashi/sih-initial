@@ -17,14 +17,51 @@ necessarily the best one.
 
 from __future__ import annotations
 
+import json
+import random
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from detection.losses import dice_loss
+
+
+def capture_rng_state(dataset, device: torch.device) -> dict:
+    """Python/NumPy/Torch RNG state, plus a dataset's own augmentation RNG
+    if it exposes one (ZenodoTileDataset.rng is a np.random.Generator) --
+    needed for TRUE resume (Phase 1.7): restoring model/optimizer state
+    alone still leaves training on a different random trajectory (batch
+    shuffling, augmentation draws) than an uninterrupted run would have
+    taken."""
+    state = {
+        "python_random": random.getstate(),
+        "numpy_random": np.random.get_state(),
+        "torch_random": torch.get_rng_state(),
+    }
+    if device.type == "cuda":
+        state["torch_cuda_random"] = torch.cuda.get_rng_state_all()
+    dataset_rng = getattr(dataset, "rng", None)
+    if dataset_rng is not None and hasattr(dataset_rng, "bit_generator"):
+        state["dataset_rng_state"] = dataset_rng.bit_generator.state
+    return state
+
+
+def restore_rng_state(state: dict | None, dataset, device: torch.device) -> None:
+    if not state:
+        return
+    random.setstate(state["python_random"])
+    np.random.set_state(state["numpy_random"])
+    torch.set_rng_state(state["torch_random"].cpu())  # torch.set_rng_state requires a CPU ByteTensor;
+    # torch.load(..., map_location=device) may have moved this to GPU if device is cuda
+    if device.type == "cuda" and "torch_cuda_random" in state:
+        torch.cuda.set_rng_state_all([t.cpu() for t in state["torch_cuda_random"]])  # same CPU-tensor requirement as torch.set_rng_state
+    dataset_rng = getattr(dataset, "rng", None)
+    if dataset_rng is not None and "dataset_rng_state" in state:
+        dataset_rng.bit_generator.state = state["dataset_rng_state"]
 
 
 @dataclass
@@ -75,6 +112,7 @@ def train(
     batch_size: int = 2,
     grad_accum_steps: int = 1,
     lr: float = 1e-3,
+    weight_decay: float = 0.0,
     checkpoint_path: str | Path | None = None,
     val_dataset=None,
     best_checkpoint_path: str | Path | None = None,
@@ -87,6 +125,10 @@ def train(
     lr_factor: float = 0.5,
     lr_min: float = 1e-6,
     sampler=None,
+    save_every_epoch_dir: str | Path | None = None,
+    keep_last_n: int = 3,
+    metrics_jsonl_path: str | Path | None = None,
+    save_rng_state: bool = False,
 ) -> TrainResult:
     """
     latest_checkpoint_path, if given, is overwritten after every epoch
@@ -117,11 +159,26 @@ def train(
     tiles have zero oil pixels (no_oil/lookalike images are 100% zero by
     construction), which pos_weight cannot address since it only
     reweights pixels within a tile that already has some oil.
+
+    save_every_epoch_dir/keep_last_n/metrics_jsonl_path/save_rng_state
+    (Phase 1.6/1.7, all default off so scripts/train_detection.py's exact
+    prior behavior is unchanged): save_every_epoch_dir writes a full
+    resumable checkpoint every epoch to `{dir}/epoch_NNNN.pt`, pruning to
+    the last `keep_last_n` (so a disconnected Colab session loses at most
+    one epoch of Drive-quota'd history, not everything). If given and
+    `latest_checkpoint_path` is None, resume picks up from the newest file
+    in that directory instead. metrics_jsonl_path appends one flushed JSON
+    line per epoch, so a killed session still leaves a readable history
+    even if no checkpoint save completed. save_rng_state additionally
+    captures/restores Python/NumPy/Torch RNG state (see capture_rng_state/
+    restore_rng_state) so a true resume continues on the same random
+    trajectory an uninterrupted run would have taken, not just from the
+    same model weights.
     """
     model.to(device)
     model.train()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler, num_workers=num_workers)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     scheduler = None
@@ -148,6 +205,28 @@ def train(
         result.history = [EpochStats(**h) for h in ckpt.get("history", [])]
         print(f"Resumed from {latest_checkpoint_path}: continuing at epoch {start_epoch}/{epochs} "
               f"(best_val_dice={result.best_val_dice} at epoch {result.best_epoch})")
+        if save_rng_state:
+            restore_rng_state(ckpt.get("rng_state"), dataset, device)
+
+    if resume and latest_checkpoint_path is None and save_every_epoch_dir is not None:
+        epoch_ckpts = sorted(Path(save_every_epoch_dir).glob("epoch_*.pt")) if Path(save_every_epoch_dir).exists() else []
+        if epoch_ckpts:
+            latest_epoch_ckpt = epoch_ckpts[-1]
+            ckpt = torch.load(latest_epoch_ckpt, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if use_amp and ckpt.get("scaler_state_dict"):
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            if scheduler is not None and ckpt.get("scheduler_state_dict"):
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            start_epoch = ckpt["epoch"] + 1
+            result.best_val_dice = ckpt.get("best_val_dice")
+            result.best_epoch = ckpt.get("best_epoch")
+            result.history = [EpochStats(**h) for h in ckpt.get("history", [])]
+            if save_rng_state:
+                restore_rng_state(ckpt.get("rng_state"), dataset, device)
+            print(f"Resumed from {latest_epoch_ckpt}: continuing at epoch {start_epoch}/{epochs} "
+                  f"(best_val_dice={result.best_val_dice} at epoch {result.best_epoch})")
 
     for epoch in range(start_epoch, epochs + 1):
         if device.type == "cuda":
@@ -199,6 +278,13 @@ def train(
         lr_str = f"  lr={optimizer.param_groups[0]['lr']:.2e}"
         print(f"epoch {epoch}/{epochs}  loss={avg_loss:.4f}  time={elapsed:.1f}s  peak_vram={vram_str}{val_str}{lr_str}")
 
+        if metrics_jsonl_path is not None:
+            metrics_jsonl_path = Path(metrics_jsonl_path)
+            metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(metrics_jsonl_path, "a") as f:
+                f.write(json.dumps(asdict(stats)) + "\n")
+                f.flush()
+
         if val_dataset is not None and (result.best_val_dice is None or val_dice > result.best_val_dice):
             result.best_val_dice = val_dice
             result.best_epoch = epoch
@@ -226,6 +312,27 @@ def train(
                 "best_epoch": result.best_epoch,
                 "history": [asdict(h) for h in result.history],
             }, latest_checkpoint_path)
+
+        if save_every_epoch_dir is not None:
+            save_every_epoch_dir = Path(save_every_epoch_dir)
+            save_every_epoch_dir.mkdir(parents=True, exist_ok=True)
+            epoch_ckpt = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if use_amp else None,
+                "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                "epoch": epoch,
+                "best_val_dice": result.best_val_dice,
+                "best_epoch": result.best_epoch,
+                "history": [asdict(h) for h in result.history],
+            }
+            if save_rng_state:
+                epoch_ckpt["rng_state"] = capture_rng_state(dataset, device)
+            torch.save(epoch_ckpt, save_every_epoch_dir / f"epoch_{epoch:04d}.pt")
+
+            existing = sorted(save_every_epoch_dir.glob("epoch_*.pt"))
+            for old in existing[:-keep_last_n] if keep_last_n > 0 else []:
+                old.unlink()
 
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)

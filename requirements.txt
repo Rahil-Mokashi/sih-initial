@@ -24,3 +24,4 @@ python-dotenv      # loads secrets (API keys) from a local .env file, see DECISI
 cdsapi              # ERA5 wind data via the Copernicus Climate Data Store, see DECISIONS.md
 folium              # real Leaflet map for the dashboard (src/dashboard/build_map.py)
 pytest              # test suite, see tests/
+pyyaml              # config-driven training (train.py --config configs/*.yaml), see Phase 1 docs

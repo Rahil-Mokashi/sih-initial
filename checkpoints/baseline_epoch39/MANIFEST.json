@@ -1,0 +1,49 @@
+{
+  "description": "Protected, immutable copy of the epoch-39 checkpoint that produced the real oil-tiles-only IoU=0.1057 baseline number (re-verified in Phase 0 as 0.1074 at threshold 0.35 using a from-scratch, unit-tested metric implementation -- see docs/metric_audit.md). The original source file is untouched at data/processed/checkpoints/latest_unet_resnet18_epoch39_backup.pt (gitignored, local-only). This copy exists so Experiment 01+ always has a known-good, never-overwritten reference point, independent of whatever the top-level best_unet_resnet18.pt currently points to (which has since moved on to epoch 44+ under the LR-scheduler continuation run).",
+  "file": "unet_resnet18_epoch39.pt",
+  "source_path": "data/processed/checkpoints/latest_unet_resnet18_epoch39_backup.pt",
+  "sha256": "0957ed26541e4d2d96323f526287fc1cd01ca6242430a17dc399e2fbed4dbebb",
+  "size_bytes": 172062996,
+  "epoch": 39,
+  "raw_val_dice_at_save_time": 0.023478873498699208,
+  "note_on_raw_val_dice": "This metric is now known to be structurally unreliable -- see docs/metric_audit.md, Metric 1. It is recorded here only for provenance (it's what the original training loop reported), not as evidence of quality. The real oil-IoU numbers below are what actually matters.",
+  "phase0_reverification": {
+    "script": "scripts/evaluate.py + scripts/sweep_threshold.py, run against this exact checkpoint",
+    "best_threshold": 0.35,
+    "oil_iou_per_tile_mean": 0.1074,
+    "oil_dice_per_tile_mean": 0.1691,
+    "oil_iou_global_pixel_accumulated": 0.1342,
+    "precision": 0.139,
+    "recall": 0.476,
+    "pred_positive_fraction_oil_tiles": 0.2902,
+    "gt_positive_fraction_oil_tiles": 0.0790,
+    "no_oil_pred_positive_fraction": 0.1603,
+    "lookalike_pred_positive_fraction": 0.2238,
+    "cache_dir": "data/processed/eval_cache/latest_unet_resnet18_epoch39_backup"
+  },
+  "training_configuration": {
+    "_provenance_note": "Reconstructed from src/detection/train.py, scripts/train_detection.py, and LOG.md's 2026-08-25 'Real training run started' entry -- NOT guessed. Fields marked UNKNOWN could not be determined from any recorded source and must not be assumed.",
+    "script": "scripts/train_detection.py (pre-Phase-1 version, no --lr/--channels CLI flags existed yet)",
+    "model": "smp.Unet(encoder_name='resnet18', encoder_weights='imagenet', in_channels=1, classes=1)",
+    "in_channels": 1,
+    "tile_size": 512,
+    "batch_size": 16,
+    "batch_size_selection": "auto-probed by scripts/train_detection.py's probe_batch_size() from candidates [16, 8, 4]; LOG.md confirms 16 was selected (3235MB peak VRAM)",
+    "num_workers": 6,
+    "loss": "DiceBCELoss(pos_weight=32.6, dice_weight=1.0, bce_weight=1.0)",
+    "pos_weight_source": "empirical, from scripts/compute_mask_class_balance.py's real oil-pixel fraction (2.98% mean) -- (1-0.0298)/0.0298 ~= 32.6",
+    "optimizer": "Adam",
+    "learning_rate": 0.001,
+    "lr_scheduler": "none active through epoch 39 -- ReduceLROnPlateau was only added AFTER resuming from this exact checkpoint (2026-08-27 pivot, see LOG.md), so it played no part in reaching epoch 39",
+    "grad_accum_steps": 1,
+    "augmentation": {
+      "train": "augment=True (src/detection/augment.py: flips, 90-degree rotations, dB-space speckle jitter std=0.5, applied before normalization)",
+      "val": "augment=False"
+    },
+    "normalization": "normalize_db_fixed: fixed clip to [-40, 10] dB then linear scale to [0,1] -- see docs/metric_audit.md Gate C.2/C.3 for the finding that this range under-utilizes Band 1's actual value distribution",
+    "oil_tile_oversampling": false,
+    "seed": "UNKNOWN / NEEDS VERIFICATION -- no global torch.manual_seed / np.random.seed / random.seed call exists anywhere in src/ or scripts/ (confirmed by direct grep). ZenodoTileDataset(seed=0) only seeds that dataset instance's own per-tile augmentation RNG, not DataLoader shuffling order, weight init, or CUDA nondeterminism. The original epoch-39 run is therefore NOT fully reproducible bit-for-bit even with identical code and data -- this is exactly the gap Phase 1's run_manifest.json + explicit seeding is meant to close going forward.",
+    "dataset_split": "scripts/build_training_pool.py, VAL_FRACTION=0.15, SPLIT_SEED=0, stratified by class + oil-fraction quartile -- 2184 train / 386 val source images, 34940 train tiles / 6176 val tiles at 512px non-overlapping",
+    "resume_history": "trained epoch-by-epoch via train()'s latest_checkpoint_path resume mechanism from epoch 1; num_workers was 0 for epoch 1 only (I/O-bound, 93min) then raised to 6 for all subsequent epochs (LOG.md 2026-08-25); epochs target was 30 initially, extended to 60 mid-run after real held-out eval showed continued improvement (LOG.md 2026-08-26/27) -- epoch 39 is a point partway through that extended run, not a run that was ever targeted to stop at exactly 39"
+  }
+}

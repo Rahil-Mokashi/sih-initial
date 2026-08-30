@@ -98,6 +98,15 @@ venv\Scripts\python.exe scripts\render_detection_overlay.py        # overlay ima
 Architecture: U-Net + ResNet18 encoder (ImageNet-pretrained), Dice + weighted-BCE loss
 (or `--loss tversky`, see below) by default, mixed precision, `num_workers>0` parallel
 tile loading (single-threaded reads left the GPU starved on I/O — see DECISIONS.md).
+
+**Config-driven training (Phase 1 infra) + Colab**: `train.py --config configs/<name>.yaml`
+is a newer, config-driven entrypoint (seeding, `run_manifest.json`, per-epoch/RNG-state
+resume) built for running experiments on Colab — see `docs/colab.md` and
+`colab_bootstrap.ipynb`. It wraps the same `src/detection/train.py` loop `scripts/train_detection.py`
+above uses, so both stay valid. **A dependency-version mismatch against `requirements-colab.txt`'s
+pins invalidates any direct comparison to the epoch-39 baseline** (real oil-tiles-only IoU
+0.1057, re-verified as 0.1074 in `docs/metric_audit.md`) — always check `run_manifest.json`'s
+recorded versions before comparing two runs.
 Zenodo downloads use a 4-connection resumable downloader
 (`scripts/_zenodo_download_utils.py`'s `download_parallel`) rather than one slow
 single-stream connection — see DECISIONS.md "Corrupted archive diagnosis and the

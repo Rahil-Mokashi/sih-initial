@@ -7,7 +7,10 @@ __pycache__/
 # raw/processed data is large and reproducible from the scripts in /scripts
 data/raw/
 data/processed/
-train_stderr.log
-train_stdout.log
-trial_*_stdout.log
-trial_*_stderr.log
+*_stdout.log
+*_stderr.log
+
+# checkpoints/ holds protected reference checkpoints (see Phase 0/1 docs) --
+# the binaries are large and belong on Drive/local disk, not git; MANIFEST.json
+# (sha256 + config) is the part that's actually meant to be versioned.
+checkpoints/**/*.pt

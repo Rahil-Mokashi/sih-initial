@@ -112,6 +112,7 @@ class ZenodoTileDataset(Dataset):
         augment: bool = False,
         seed: int = 0,
         channels: tuple[int, ...] = (1,),
+        normalize_fn=None,
     ):
         """
         channels selects which 1-indexed rasterio bands to read, e.g. (1,)
@@ -122,6 +123,13 @@ class ZenodoTileDataset(Dataset):
         explicitly) keep the exact prior single-channel behavior;
         scripts/train_detection.py's --channels flag is what actually opts
         into dual-channel training.
+
+        normalize_fn, if given, replaces the default normalize_db_fixed
+        call with any callable(image) -> image in [0,1] -- e.g.
+        functools.partial(normalize_db_per_channel, ranges=[...]) for the
+        per-band ranges Gate C's audit found necessary (see
+        docs/metric_audit.md). Defaults to None, which keeps the exact
+        original normalize_db_fixed(image) behavior.
         """
         self.tile_size = tile_size
         self.stride = stride or tile_size
@@ -129,6 +137,7 @@ class ZenodoTileDataset(Dataset):
         self.rng = np.random.default_rng(seed)
         self.pairs = pairs
         self.channels = channels
+        self.normalize_fn = normalize_fn or normalize_db_fixed
 
         self.index: list[tuple[int, int, int]] = []  # (pair_idx, row_off, col_off)
         for i, pair in enumerate(pairs):
@@ -147,11 +156,13 @@ class ZenodoTileDataset(Dataset):
         window = Window(x, y, self.tile_size, self.tile_size)
 
         with rasterio.open(pair.image_path) as src:
-            image = src.read(1, window=window).astype(np.float32)
+            image = src.read(list(self.channels), window=window).astype(np.float32)  # (C, H, W)
+            if len(self.channels) == 1:
+                image = image[0]  # (H, W) -- keeps the exact original single-channel shape/behavior
         with rasterio.open(pair.mask_path) as src:
             mask = src.read(1, window=window).astype(np.float32)
 
-        image = lee_filter(image)
+        image = lee_filter(image)  # per-channel automatically if image is (C, H, W)
 
         # Augment (flips/rotation/dB-scale speckle jitter) BEFORE normalizing:
         # the speckle jitter's std is calibrated in real dB units, so it must
@@ -161,9 +172,11 @@ class ZenodoTileDataset(Dataset):
         if self.augment:
             image, mask = augment_pair(image, mask, self.rng)
 
-        image = normalize_db_fixed(image)
+        image = self.normalize_fn(image)
 
-        image_t = torch.from_numpy(image).unsqueeze(0).float()
+        image_t = torch.from_numpy(image).float()
+        if image_t.ndim == 2:
+            image_t = image_t.unsqueeze(0)  # (H, W) -> (1, H, W); already (C, H, W) otherwise
         mask_t = torch.from_numpy(mask).unsqueeze(0).float()
         return image_t, mask_t
 
