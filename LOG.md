@@ -1406,3 +1406,79 @@ hibernate-after-1h-on-battery was still enabled (a known risk this
 project's LOG.md already flagged once before) and caused a real ~6-hour
 gap at epoch 4 of the oversampling trial -- disabled hibernate/sleep on
 battery entirely so it can't recur.
+
+---
+
+## 2026-08-31 — Phase 0 metric audit + Phase 1 Colab/reproducibility infra
+
+Before any new training: audited whether the three tuning trials above
+were real failures or a broken metric, per a structured diagnostics plan.
+Full writeup in `docs/metric_audit.md`; short version:
+
+- **Gate A (cheap, invalidating)**: model overfits 12 fixed oil-containing
+  tiles (mean IoU 0.9841, loss 2.37->0.024) -- core pipeline (mask
+  alignment, label polarity, loss, normalization) is sound. Confirmed 2
+  real SAR bands exist in every Zenodo part (distinct dB stats, not a
+  duplicate) with only band 1 consumed by production. Confirmed
+  `"lookalike"` is a real, explicit manifest label (582 train / 103 val),
+  not a proxy.
+- **Gate B (metric trust)**: the training loop's raw `val_dice` has a real,
+  now-diagnosed flaw -- any tile with zero ground-truth oil scores ~0
+  under it for almost any nonzero prediction (verified numerically), so
+  with ~82% of tiles empty, it's structurally near-uninformative. That
+  explains why it looked equally flat across all four configs. Separately,
+  the "real IoU" used for the actual 0.1057 comparison
+  (`scripts/evaluate_test_set.py`/`compare_checkpoints_on_val.py`) was
+  independently reproduced from scratch (0.1074, unit-tested, using the
+  exact epoch-39 weights preserved in
+  `latest_unet_resnet18_epoch39_backup.pt` -- the top-level
+  `best_unet_resnet18.pt` has since moved on to epoch 44+ under the
+  LR-scheduler continuation and is NOT epoch 39 anymore). All three trials
+  re-scored below baseline at their own best threshold, each with a
+  distinct, now-quantified failure signature (`oversample`/`tversky`:
+  predict-almost-everything, precision ~0.08-0.10, pred-positive-fraction
+  0.66-0.99 across every class including no_oil/lookalike;
+  `posweight_sched`: generally under-confident probabilities, but only 1
+  epoch of training). New finding the old scripts never surfaced: even the
+  baseline's best-threshold precision is only ~0.14, with 16-22%
+  false-positive pixel rates on clean/lookalike scenes -- 0.1057 describes
+  a broadly over-triggering detector, not a precise one.
+- **Gate C (data integrity)**: independently re-verified 82.38% of 34,940
+  training tiles have zero oil pixels (matches the 82.4% claimed
+  previously). Visual audit (`scripts/visualize_dataset.py`, real montages
+  in `reports/dataset_visual_audit/`) surfaced an unplanned finding: Band
+  1's normalized values are visibly and numerically compressed (median
+  0.13, 31% of pixels below 0.10) under the current shared -40/10 dB fixed
+  normalization range, while Band 2 sits well-centered (median 0.40) --
+  likely, not yet proven, a contributing cause of the weak precision
+  above. Train/val leakage: split is at the whole-image level (no
+  same-file leakage, confirmed in code); 0 exact-duplicate files found
+  across the split via content hash; scene/acquisition-level leakage
+  UNPROVEN (no such metadata exists in the files).
+
+**Phase 1**: built `train.py` (config-driven entrypoint wrapping the
+existing `src/detection/train.py` loop, unchanged for
+`scripts/train_detection.py`), `configs/baseline.yaml` (epoch-39's config
+reconstructed field-by-field, `seed` marked UNKNOWN since none was ever
+set), per-band normalization (`normalize_db_per_channel`, per Amendment 2),
+per-epoch checkpointing + RNG-state true resume + `metrics.jsonl`, a
+`run_manifest.json` per run, and `colab_bootstrap.ipynb` +
+`requirements-colab.txt` for running experiments on Colab. Protected the
+epoch-39 checkpoint at `checkpoints/baseline_epoch39/` (sha256 recorded in
+its `MANIFEST.json`).
+
+Real bugs caught by actually running things, not just reading code:
+`ZenodoTileDataset`'s `channels` param (added earlier this session) was
+never wired into `__getitem__` -- the two-channel read path was
+non-functional until fixed (commit `17a8845`, NOT the earlier `c70349a`
+which introduced the param). `torch.set_rng_state`/
+`torch.cuda.set_rng_state_all` both require CPU tensors, which
+`map_location=device` had moved to GPU -- resume crashed until fixed, then
+verified working end-to-end on a tiny manifest (correct epoch continuation,
+correct loss trajectory, correct keep_last_n pruning).
+
+**Experiment 01 (channel ablation) must pin to commit `17a8845`** (Group 3:
+"Add config-driven training entrypoint + Colab reproducibility infra"),
+not `c70349a` (Group 1: "Add optional multi-channel support to the
+detection preprocessing path") -- the latter's dual-channel path did not
+actually work.
