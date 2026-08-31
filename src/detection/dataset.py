@@ -114,6 +114,7 @@ class ZenodoTileDataset(Dataset):
         channels: tuple[int, ...] = (1,),
         normalize_fn=None,
         return_nodata_mask: bool = False,
+        explicit_index: list[tuple[int, int, int]] | None = None,
     ):
         """
         channels selects which 1-indexed rasterio bands to read, e.g. (1,)
@@ -145,6 +146,15 @@ class ZenodoTileDataset(Dataset):
         depends on. Defaults to False: every existing caller (SARTileDataset
         is unaffected entirely; old scripts/tests using ZenodoTileDataset
         without this flag) keeps the exact original 2-tuple return.
+
+        explicit_index, if given, is a list of (pair_idx, row_off, col_off)
+        tuples used AS-IS instead of the auto-generated full non-overlapping
+        grid below -- lets a caller train on a specific TILE-level subset
+        (e.g. an oil/zero-oil-balanced ablation manifest -- see
+        scripts/build_ablation_manifest.py) even though `pairs`/the manifest
+        CSV format is only ever per-SOURCE-IMAGE, not per-tile. Defaults to
+        None, which keeps the exact original "every tile of every listed
+        image" behavior for every existing caller.
         """
         self.tile_size = tile_size
         self.stride = stride or tile_size
@@ -155,13 +165,16 @@ class ZenodoTileDataset(Dataset):
         self.normalize_fn = normalize_fn or normalize_db_fixed
         self.return_nodata_mask = return_nodata_mask
 
-        self.index: list[tuple[int, int, int]] = []  # (pair_idx, row_off, col_off)
-        for i, pair in enumerate(pairs):
-            with rasterio.open(pair.image_path) as src:
-                h, w = src.height, src.width
-            for y in range(0, h - tile_size + 1, self.stride):
-                for x in range(0, w - tile_size + 1, self.stride):
-                    self.index.append((i, y, x))
+        if explicit_index is not None:
+            self.index: list[tuple[int, int, int]] = list(explicit_index)
+        else:
+            self.index = []  # (pair_idx, row_off, col_off)
+            for i, pair in enumerate(pairs):
+                with rasterio.open(pair.image_path) as src:
+                    h, w = src.height, src.width
+                for y in range(0, h - tile_size + 1, self.stride):
+                    for x in range(0, w - tile_size + 1, self.stride):
+                        self.index.append((i, y, x))
 
     def __len__(self) -> int:
         return len(self.index)

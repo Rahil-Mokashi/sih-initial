@@ -1,10 +1,27 @@
 # Experiment 01c: both real SAR bands, per-band normalization, in_channels=2.
 #
-# Part of a four-point comparison against the epoch-39 baseline (real
-# oil-tiles-only IoU 0.1074 at threshold 0.35, precision 0.139, recall
-# 0.476 -- see docs/metric_audit.md; NOT re-trained, that number is already
-# measured). The other two trained arms are exp01a_band1_perband.yaml
-# (Band 1 alone) and exp01b_band2_perband.yaml (Band 2 alone).
+# Part of a four-point comparison against the epoch-39 baseline -- USE THE
+# CORRECTED, nodata-masked, full-386-image-validation-set number: real
+# oil-tiles-only IoU 0.1056, Dice 0.1666, Precision 0.1383, Recall 0.4800
+# at threshold 0.35 (see docs/metric_audit.md). The originally-quoted
+# 0.1074/0.169/0.139/0.476 was computed on an incomplete 344/386-image
+# validation set (scripts/evaluate.py had a real cache-key collision bug,
+# since fixed -- see that script's _cache_filename docstring) and without
+# nodata masking; NOT re-trained, the corrected number is already measured.
+# The other two trained arms are exp01a_band1_perband.yaml (Band 1 alone)
+# and exp01b_band2_perband.yaml (Band 2 alone).
+#
+# This is a 25-epoch comparative ablation, not a from-scratch reproduction
+# of the 60-epoch baseline run: trains on data/processed/train_manifest_ablation.csv
+# (all oil-containing tiles + an equal-count random zero-oil sample, seed 42,
+# + all lookalike tiles -- see scripts/build_ablation_manifest.py; report
+# its printed tile count/% for the exact figures), NOT the full
+# train_manifest.csv. val_manifest is unchanged (all 386 images, full grid)
+# so results stay directly comparable to the corrected baseline above.
+# amp/channels_last are opt-in performance flags (see docs/colab.md or
+# src/detection/train.py's _resolve_amp docstring) -- turning them on
+# changes numerics slightly (see scripts/verify_amp.py's real batch-loss
+# comparison) but is not expected to change conclusions.
 #
 # Every setting below is inherited UNCHANGED from configs/baseline.yaml
 # except `in_channels`/`channels` (2 / [1, 2] -- the whole point of this
@@ -53,8 +70,11 @@ scheduler_parameters: {}
 batch_size: 16
 grad_accum_steps: 1
 num_workers: 6
-epochs: 60
+epochs: 25  # comparative ablation on the subset manifest below, not the full 60-epoch baseline run
 keep_last_n: 3
+
+amp: true            # opt-in; see scripts/verify_amp.py for the real per-batch loss delta this makes
+channels_last: true  # opt-in; torch.channels_last memory format for model + image batches
 
 # Explicit seed (baseline.yaml has none -- no global seed was ever set for
 # the original epoch-39 run, see its MANIFEST.json). This is a NECESSARY
@@ -99,7 +119,13 @@ augmentation:
   speckle_jitter_std_db: 0.5
 
 dataset:
-  train_manifest: data/processed/train_manifest.csv
+  # Tile-level ablation subset (see scripts/build_ablation_manifest.py) --
+  # NOT the full train_manifest.csv. train.py's load_manifest() detects the
+  # extra row_offset/col_offset columns and trains on exactly these
+  # selected tiles instead of auto-tiling every listed image's full grid.
+  train_manifest: data/processed/train_manifest_ablation.csv
+  # val_manifest UNCHANGED: full 386-image validation set, full grid, so
+  # results stay directly comparable to the corrected baseline (see header).
   val_manifest: data/processed/val_manifest.csv
   split_seed: 0
   val_fraction: 0.15

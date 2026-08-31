@@ -79,12 +79,38 @@ def set_seed(seed: int | None, deterministic: bool) -> None:
         torch.backends.cudnn.benchmark = False
 
 
-def load_manifest(path: Path) -> list[ImageMaskPair]:
-    pairs = []
+def load_manifest(path: Path) -> tuple[list[ImageMaskPair], list[tuple[int, int, int]] | None]:
+    """Returns (pairs, explicit_index).
+
+    explicit_index is None for the plain 3-column (image_path,mask_path,
+    label) manifest format -- exact original behavior, ZenodoTileDataset
+    auto-tiles every listed image's full grid.
+
+    For the EXTENDED 5-column tile-level format (image_path,mask_path,
+    label,row_offset,col_offset -- written by
+    scripts/build_ablation_manifest.py, e.g. Experiment 01's ablation
+    subset), returns the deduplicated per-image `pairs` plus an explicit
+    (pair_idx, row_offset, col_offset) index so ZenodoTileDataset trains on
+    exactly the selected TILES, not every tile of every listed image."""
     with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            pairs.append(ImageMaskPair(Path(row["image_path"]), Path(row["mask_path"]), row["label"]))
-    return pairs
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    if "row_offset" in fieldnames and "col_offset" in fieldnames:
+        pair_index_by_path: dict[str, int] = {}
+        pairs: list[ImageMaskPair] = []
+        explicit_index: list[tuple[int, int, int]] = []
+        for row in rows:
+            key = row["image_path"]
+            if key not in pair_index_by_path:
+                pair_index_by_path[key] = len(pairs)
+                pairs.append(ImageMaskPair(Path(row["image_path"]), Path(row["mask_path"]), row["label"]))
+            explicit_index.append((pair_index_by_path[key], int(row["row_offset"]), int(row["col_offset"])))
+        return pairs, explicit_index
+
+    pairs = [ImageMaskPair(Path(row["image_path"]), Path(row["mask_path"]), row["label"]) for row in rows]
+    return pairs, None
 
 
 def build_normalize_fn(config: dict):
@@ -171,8 +197,11 @@ def main() -> None:
     write_run_manifest(config, args.config, output_dir, device, git_sha, is_dirty)
 
     dataset_cfg = config.get("dataset", {}) or {}
-    train_pairs = load_manifest(REPO_ROOT / dataset_cfg.get("train_manifest", "data/processed/train_manifest.csv"))
-    val_pairs = load_manifest(REPO_ROOT / dataset_cfg.get("val_manifest", "data/processed/val_manifest.csv"))
+    train_pairs, train_explicit_index = load_manifest(REPO_ROOT / dataset_cfg.get("train_manifest", "data/processed/train_manifest.csv"))
+    val_pairs, val_explicit_index = load_manifest(REPO_ROOT / dataset_cfg.get("val_manifest", "data/processed/val_manifest.csv"))
+    if train_explicit_index is not None:
+        print(f"train_manifest is a tile-level subset ({len(train_pairs)} unique source images, "
+              f"{len(train_explicit_index)} selected tiles) -- see scripts/build_ablation_manifest.py")
 
     channels = tuple(config.get("channels", [1]))
     normalize_fn, norm_desc = build_normalize_fn(config)
@@ -187,10 +216,10 @@ def main() -> None:
     # experimental option (see LOG.md's nodata-masking entry).
     train_dataset = ZenodoTileDataset(train_pairs, tile_size=tile_size, augment=augment_enabled,
                                        seed=seed or 0, channels=channels, normalize_fn=normalize_fn,
-                                       return_nodata_mask=True)
+                                       return_nodata_mask=True, explicit_index=train_explicit_index)
     val_dataset = ZenodoTileDataset(val_pairs, tile_size=tile_size, augment=False,
                                      channels=channels, normalize_fn=normalize_fn,
-                                     return_nodata_mask=True)
+                                     return_nodata_mask=True, explicit_index=val_explicit_index)
     print(f"train tiles: {len(train_dataset)}, val tiles: {len(val_dataset)}, "
           f"channels={channels}, normalization={norm_desc}")
 
