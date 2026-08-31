@@ -42,6 +42,7 @@ from rasterio.windows import Window
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from detection.inference import load_model_for_inference, predict_probs  # noqa: E402
 from detection.metrics import aggregate_global, tile_metrics  # noqa: E402
+from detection.preprocess import compute_nodata_mask  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VAL_MANIFEST = REPO_ROOT / "data" / "processed" / "val_manifest.csv"
@@ -72,17 +73,58 @@ def load_manifest(path: Path) -> list[tuple[Path, Path, str]]:
     return [(Path(r["image_path"]), Path(r["mask_path"]), r["label"]) for r in rows]
 
 
+def _cache_filename(image_path: Path, label: str) -> str:
+    """Zenodo's oil/no_oil/lookalike source folders each number their images
+    independently (all starting near 1), so the same bare stem (e.g.
+    "00098") legitimately exists in more than one class -- 41 of the 386
+    val-manifest stems collide this way. Keying the cache file by bare stem
+    alone (the original scheme) let images from different classes silently
+    overwrite each other's cache entry, undercounting the validation set by
+    42/386 images (10.9%) with no error or warning. Prefixing with the
+    label makes the key unique; this is a real correctness bug fix, not
+    part of the nodata-masking work, discovered while re-running this
+    script -- the ORIGINAL historical baseline numbers, computed with the
+    unprefixed scheme, likely had the same gap."""
+    return f"{label}__{image_path.stem}.npz"
+
+
+def _npz_has_valid_mask(npz_path: Path) -> bool:
+    return "valid" in np.load(npz_path).files
+
+
+def cache_needs_update(cache_dir: Path, pairs: list[tuple[Path, Path, str]]) -> bool:
+    """True if cache_probability_maps has any real work to do: cache dir
+    missing/incomplete, OR any existing .npz predates the nodata-masking
+    fix (no 'valid' array) and needs upgrading in place. Lets `main()` skip
+    loading the model entirely when the cache is already fully current."""
+    if not cache_dir.exists():
+        return True
+    for image_path, _mask_path, label in pairs:
+        out_path = cache_dir / _cache_filename(image_path, label)
+        if not out_path.exists() or not _npz_has_valid_mask(out_path):
+            return True
+    return False
+
+
 def cache_probability_maps(model, device, pairs: list[tuple[Path, Path, str]], channels: tuple[int, ...], cache_dir: Path) -> None:
     """One forward pass per tile, per image; writes one .npz per source image
-    (probs stacked (n_tiles, H, W) float16 + gt stacked (n_tiles, H, W) uint8)
-    to cache_dir. Skips images whose cache file already exists, so a partial
-    or interrupted run can resume without re-doing finished images."""
+    (probs stacked (n_tiles, H, W) float16 + gt stacked (n_tiles, H, W) uint8
+    + valid stacked (n_tiles, H, W) bool -- see detection.preprocess.compute_nodata_mask,
+    True=real pixel/False=exact-0.0-dB-in-both-bands nodata) to cache_dir,
+    named "{label}__{stem}.npz" (see _cache_filename -- NOT bare stem, which
+    collides across classes).
+
+    Skips images whose cache file already exists AND already carries a
+    'valid' array, so a partial/interrupted run resumes without re-doing
+    finished images -- and a pre-nodata-masking cache from before this field
+    existed gets transparently recomputed/upgraded in place rather than
+    silently reused with stale (nodata-unaware) data."""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    for i, (image_path, mask_path, _label) in enumerate(pairs):
-        out_path = cache_dir / f"{image_path.stem}.npz"
-        if out_path.exists():
+    for i, (image_path, mask_path, label) in enumerate(pairs):
+        out_path = cache_dir / _cache_filename(image_path, label)
+        if out_path.exists() and _npz_has_valid_mask(out_path):
             continue
-        probs_list, gt_list = [], []
+        probs_list, gt_list, valid_list = [], [], []
         with rasterio.open(image_path) as img_src, rasterio.open(mask_path) as mask_src:
             h, w = img_src.height, img_src.width
             for y in range(0, h - TILE_SIZE + 1, TILE_SIZE):
@@ -91,11 +133,19 @@ def cache_probability_maps(model, device, pairs: list[tuple[Path, Path, str]], c
                     image_tile = img_src.read(list(channels), window=window).astype(np.float32)
                     if len(channels) == 1:
                         image_tile = image_tile[0]
+                    # Nodata detection always reads both raw bands directly (independent
+                    # of `channels`, and BEFORE predict_probs's internal despeckling would
+                    # blur exact-zero pixels into non-zero neighbors) -- same convention as
+                    # detection.dataset.ZenodoTileDataset(return_nodata_mask=True).
+                    raw_band1 = img_src.read(1, window=window).astype(np.float32)
+                    raw_band2 = img_src.read(2, window=window).astype(np.float32)
+                    valid_tile = ~compute_nodata_mask(raw_band1, raw_band2)
                     gt_tile = mask_src.read(1, window=window).astype(np.float32)
                     probs = predict_probs(model, image_tile, device)
                     probs_list.append(probs.astype(np.float16))
                     gt_list.append((gt_tile > 0).astype(np.uint8))
-        np.savez_compressed(out_path, probs=np.stack(probs_list), gt=np.stack(gt_list))
+                    valid_list.append(valid_tile)
+        np.savez_compressed(out_path, probs=np.stack(probs_list), gt=np.stack(gt_list), valid=np.stack(valid_list))
         if (i + 1) % 25 == 0:
             print(f"  cached {i + 1}/{len(pairs)} images")
 
@@ -111,22 +161,38 @@ def load_cached_tiles(cache_dir: Path) -> list[tuple[np.ndarray, np.ndarray]]:
     return tiles
 
 
-def load_cached_tiles_by_label(cache_dir: Path, pairs: list[tuple[Path, Path, str]]) -> list[tuple[np.ndarray, np.ndarray, str]]:
+def load_cached_tiles_by_label(cache_dir: Path, pairs: list[tuple[Path, Path, str]]) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, str]]:
     """Same as load_cached_tiles, but tags each tile with its SOURCE IMAGE's
     manifest label (oil/no_oil/lookalike) -- distinct from a tile's own
     has_oil flag, since e.g. a "lookalike" source image is still expected to
     have an all-empty ground-truth mask (lookalikes are a negative class by
     construction; see DECISIONS.md), so "label" and "has_oil" answer
     different questions (what kind of scene is this vs. does this specific
-    512x512 crop happen to contain oil pixels)."""
-    label_by_stem = {image_path.stem: label for image_path, _mask_path, label in pairs}
+    512x512 crop happen to contain oil pixels).
+
+    Also returns each tile's nodata-validity mask (bool, True=real pixel) --
+    the cache is guaranteed to carry one by this point (cache_probability_maps
+    upgrades any cache file that predates it).
+
+    Label is read directly from the "{label}__{stem}.npz" filename
+    (_cache_filename), NOT looked up by bare stem -- a stem-keyed lookup is
+    exactly the ambiguity that let cross-class filename collisions silently
+    drop 42/386 images from every report this script has ever produced
+    before this fix (see _cache_filename's docstring)."""
     tiles = []
-    for npz_path in sorted(cache_dir.glob("*.npz")):
-        label = label_by_stem.get(npz_path.stem, "unknown")
+    npz_paths = sorted(cache_dir.glob("*__*.npz"))
+    for npz_path in npz_paths:
+        label = npz_path.stem.split("__", 1)[0]
         data = np.load(npz_path)
-        probs, gt = data["probs"], data["gt"]
+        probs, gt, valid = data["probs"], data["gt"], data["valid"]
         for i in range(probs.shape[0]):
-            tiles.append((probs[i].astype(np.float32), gt[i], label))
+            tiles.append((probs[i].astype(np.float32), gt[i], valid[i], label))
+
+    if len(npz_paths) != len(pairs):
+        print(f"WARNING: {len(npz_paths)} cached images found for {len(pairs)} manifest rows -- "
+              f"a report built from this is scoring an incomplete validation set. "
+              f"(This exact mismatch is what _cache_filename's label prefix is meant to prevent "
+              f"going forward; a stale pre-fix cache directory can still show it once.)")
     return tiles
 
 
@@ -135,21 +201,26 @@ def _mean_of(key: str, metrics_list: list[dict]) -> float | None:
     return float(np.mean(vals)) if vals else None
 
 
-def report_at_threshold(labeled_tiles: list[tuple[np.ndarray, np.ndarray, str]], threshold: float) -> dict:
-    tiles = [(probs, gt) for probs, gt, _label in labeled_tiles]
-    per_tile = [tile_metrics(probs, gt, threshold) for probs, gt in tiles]
-    oil_tiles = [(probs, gt) for (probs, gt), m in zip(tiles, per_tile) if m["has_oil"]]
-    oil_metrics = [m for m in per_tile if m["has_oil"]]
+def report_at_threshold(labeled_tiles: list[tuple[np.ndarray, np.ndarray, np.ndarray, str]], threshold: float) -> dict:
+    tiles = [(probs, gt) for probs, gt, _valid, _label in labeled_tiles]
+    valids = [valid for _probs, _gt, valid, _label in labeled_tiles]
+    per_tile = [tile_metrics(probs, gt, threshold, valid_mask=valid) for (probs, gt), valid in zip(tiles, valids)]
+    oil_tiles, oil_valids, oil_metrics = [], [], []
+    for (probs, gt), valid, m in zip(tiles, valids, per_tile):
+        if m["has_oil"]:
+            oil_tiles.append((probs, gt))
+            oil_valids.append(valid)
+            oil_metrics.append(m)
 
     per_class = {}
     for class_label in ("oil", "no_oil", "lookalike"):
-        class_pairs = [(probs, gt) for probs, gt, label in labeled_tiles if label == class_label]
-        if not class_pairs:
+        class_items = [(probs, gt, valid) for probs, gt, valid, label in labeled_tiles if label == class_label]
+        if not class_items:
             per_class[class_label] = None
             continue
-        class_metrics = [tile_metrics(probs, gt, threshold) for probs, gt in class_pairs]
+        class_metrics = [tile_metrics(probs, gt, threshold, valid_mask=valid) for probs, gt, valid in class_items]
         per_class[class_label] = {
-            "n_tiles": len(class_pairs),
+            "n_tiles": len(class_items),
             "pred_positive_fraction": _mean_of("pred_positive_fraction", class_metrics),
             "gt_positive_fraction": _mean_of("gt_positive_fraction", class_metrics),
             # for no_oil/lookalike source images every tile is GT-empty by construction,
@@ -162,6 +233,7 @@ def report_at_threshold(labeled_tiles: list[tuple[np.ndarray, np.ndarray, str]],
 
     return {
         "threshold": threshold,
+        "nodata_masked": True,  # exact-0.0-dB-in-both-bands pixels excluded from every metric below -- see docs/metric_audit.md Finding #12
         "n_tiles_total": len(tiles),
         "n_tiles_with_oil": len(oil_tiles),
         "oil_tiles_per_tile_mean": {
@@ -172,14 +244,14 @@ def report_at_threshold(labeled_tiles: list[tuple[np.ndarray, np.ndarray, str]],
             "pred_positive_fraction": _mean_of("pred_positive_fraction", oil_metrics),
             "gt_positive_fraction": _mean_of("gt_positive_fraction", oil_metrics),
         },
-        "oil_tiles_global": aggregate_global(oil_tiles, threshold) if oil_tiles else None,
+        "oil_tiles_global": aggregate_global(oil_tiles, threshold, valid_masks=oil_valids) if oil_tiles else None,
         "all_tiles_per_tile_mean": {
             "iou": _mean_of("iou", per_tile),
             "dice": _mean_of("dice", per_tile),
             "precision": _mean_of("precision", per_tile),
             "recall": _mean_of("recall", per_tile),
         },
-        "all_tiles_global": aggregate_global(tiles, threshold),
+        "all_tiles_global": aggregate_global(tiles, threshold, valid_masks=valids),
         "per_source_class": per_class,
     }
 
@@ -231,13 +303,12 @@ def main() -> None:
     pairs = load_manifest(args.manifest)
     print(f"manifest: {len(pairs)} real images ({args.manifest})")
 
-    already_cached = cache_dir.exists() and len(list(cache_dir.glob("*.npz"))) >= len(pairs)
-    if already_cached:
-        print(f"using existing cache at {cache_dir} ({len(pairs)} images already cached)")
-    else:
+    if cache_needs_update(cache_dir, pairs):
         model = load_model_for_inference(args.checkpoint, device, in_channels=len(channels))
-        print(f"caching probability maps to {cache_dir} ...")
+        print(f"caching probability maps to {cache_dir} (recomputing/upgrading any file missing the nodata 'valid' mask) ...")
         cache_probability_maps(model, device, pairs, channels, cache_dir)
+    else:
+        print(f"using existing cache at {cache_dir} ({len(pairs)} images already cached, all with nodata masks)")
 
     labeled_tiles = load_cached_tiles_by_label(cache_dir, pairs)
     report = report_at_threshold(labeled_tiles, args.threshold)

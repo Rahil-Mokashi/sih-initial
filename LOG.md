@@ -1482,3 +1482,111 @@ correct loss trajectory, correct keep_last_n pruning).
 not `c70349a` (Group 1: "Add optional multi-channel support to the
 detection preprocessing path") -- the latter's dual-channel path did not
 actually work.
+
+---
+
+## 2026-08-31 — Nodata masking, a real eval cache-collision bug found and
+fixed, corrected baseline, AMP/channels_last flags, Experiment 01 ablation
+subset
+
+**Nodata masking (Finding #12, previously diagnosed but never fixed).**
+Exact-0.0-dB-in-both-bands pixels (the real nodata mask from the per-band
+normalization work above) were being trained on and scored as if they were
+real signal, in both loss and metrics, with no way to exclude them.
+Fixed properly, not by zeroing inputs (that's wrong for BCE's mean
+reduction -- see `src/detection/losses.py`'s docstrings for why dice/
+Tversky can be zeroed safely but BCE needs an explicit masked-mean instead):
+`src/detection/preprocess.py::compute_nodata_mask`, threaded through
+`ZenodoTileDataset(return_nodata_mask=True)` (computed from RAW pre-despeckle
+band values, kept spatially aligned through flip/rotation augmentation --
+`augment.py`'s `augment_pair` now accepts `extra_masks`), `losses.py`'s
+`dice_loss`/`DiceBCELoss`/`TverskyLoss`, and `metrics.py`'s `iou_dice`/
+`precision_recall`/`tile_metrics`/`aggregate_global`, all via an optional
+`mask`/`valid_mask` parameter (`None` reproduces the exact prior behavior
+for every existing caller). Wired into `train.py`'s config-driven entrypoint
+unconditionally (every future run through it is masked, not a config
+toggle) -- `configs/baseline.yaml` now documents this as one more permanent
+divergence from epoch-39's original run, on top of the already-documented
+missing seed.
+
+Real dataset-wide fraction (`scripts/compute_nodata_fraction.py`, full
+386-image/6,176-tile validation set, not the earlier 1.81% single-image
+estimate): **2.96% of validation pixels are nodata** (47.86M/1.619B); 6.40%
+of tiles have any nodata pixel, 1.20% (74 tiles) are entirely nodata.
+`no_oil`/`lookalike` images run ~4.1-4.25% nodata vs. `oil` images at 1.55%.
+Confirmed the 74 fully-nodata tiles don't produce NaN/divide-by-zero in
+`aggregate_global`/`tile_metrics` -- they boolean-index down to empty
+arrays, which the existing `union==0`/`tp+fp==0` "nothing to score, call it
+perfect" convention already catches for free (checked on the real 74 tiles,
+not just synthetic cases -- zero NaN).
+
+**Real bug found while re-running `scripts/evaluate.py` for a fair exp01
+baseline: a cache-key collision silently dropped 42/386 validation images
+(10.9%) from every report this script has ever produced.** Zenodo's oil/
+no_oil/lookalike source folders each number their images independently, so
+the same filename stem (e.g. `00098.tif`) exists in more than one class (41
+of 386 val stems collide) -- the cache was keyed by bare stem only, so a
+later image silently overwrote an earlier one's cache file. This affected
+**every historical number from this script**, confirmed directly: all four
+existing cache directories (`latest_unet_resnet18_epoch39_backup`, and all
+three `trial_*` caches from the earlier tuning-trial comparison) have
+exactly 344 npz files, not 386. Fixed by keying cache files
+`{label}__{stem}.npz` instead (`scripts/evaluate.py::_cache_filename`),
+plus a count cross-check that now warns loudly if this ever recurs.
+exp01's own pre-flight check is NOT affected (it never went through this
+caching path); `scripts/evaluate_test_set.py` (the separate Part III
+test-set script) doesn't use this per-stem caching pattern either, so it
+isn't exposed to the same bug -- checked, not assumed, though only via a
+targeted grep for the same pattern, not a full independent audit.
+
+**Corrected, fair baseline for exp01 comparison** (`checkpoints/baseline_epoch39/`,
+threshold 0.35, full 386-image/6,176-tile validation set, both fixes
+applied): **oil IoU 0.1056, Dice 0.1666, Precision 0.1383, Recall 0.4800**
+-- supersedes the original 0.1074/0.169/0.139/0.476 (which was both
+missing 42 images AND unmasked). Decomposed the two effects on the same
+complete corrected cache to isolate them: unmasked-but-complete gives IoU
+0.105635 vs. masked-and-complete 0.105625 -- nodata masking's own effect on
+this headline metric is negligible (4th-5th decimal place, only 22/1,089
+real oil tiles contain any nodata pixel at all); essentially the entire
+shift from the original number is the cache-collision fix, not the masking
+work. The three historical trial-comparison numbers in `docs/metric_audit.md`'s
+Gate B.5 table are very likely affected by the same collision bug too (not
+yet re-run) -- the gaps there (precision 0.08-0.10 vs. baseline's ~0.14)
+are large enough that the ranking is unlikely to flip, but that's an
+assumption, not verified.
+
+**`amp`/`channels_last` config flags** (both opt-in, default off, zero
+effect on any caller that doesn't set them): `_resolve_amp(amp, device)` in
+`src/detection/train.py` replaces the old hardcoded `device.type=="cuda"`
+AMP toggle with an explicit override, still gated to only take effect on
+cuda. Verified real, not just wired: `scripts/verify_amp.py` ran 5 real
+batches on 4 real oil-class images, identical initial weights and batch
+order, `amp=True` vs `amp=False` -- losses close but not identical (max abs
+diff 0.0302, mean 0.0079 across the 5 batches), as expected from fp16
+reduced precision. `channels_last` moves the model and image batches (not
+masks/valid, which it doesn't meaningfully affect) to `torch.channels_last`
+memory format the same way.
+
+**Experiment 01 ablation subset manifest** (`scripts/build_ablation_manifest.py`
+-- the plain per-image manifest CSV format can't express a tile-level
+subset, so `ZenodoTileDataset` gained an `explicit_index` param and
+`train.py`'s `load_manifest` now detects an extended 5-column
+`row_offset`/`col_offset` format to use it). Scanned the real per-tile
+oil presence across all 34,940 real training tiles: **6,155 oil-containing
+tiles + 9,308 lookalike tiles (unconditional, all zero-oil by construction)
++ 6,155 randomly-sampled (seed=42) zero-oil non-lookalike tiles = 21,618
+tiles selected, 61.87% of the full 34,940-tile training set** -- written to
+`data/processed/train_manifest_ablation.csv` (gitignored, regenerable),
+original `train_manifest.csv` untouched. Verified end-to-end: `load_manifest`
+correctly resolves 2,183 unique source images + exactly 21,618 explicit
+tile positions, `ZenodoTileDataset(explicit_index=...)` produces exactly
+that many items with correct shapes; `val_manifest.csv` still resolves
+`explicit_index=None` (unaffected, full grid). `configs/exp01{a,b,c}`
+updated: `epochs: 25` (comparative ablation, not the 60-epoch baseline
+run), `amp: true`, `channels_last: true`, `train_manifest` pointed at the
+subset, `val_manifest` left at the full 386-image set so results stay
+directly comparable to the corrected baseline above. No training run yet.
+
+Test suite: 56/56 passing (36 pre-existing + 20 added this session across
+`test_preprocess.py`, `test_losses.py`, `test_augment.py`, `test_metrics.py`,
+`test_dataset.py`).
