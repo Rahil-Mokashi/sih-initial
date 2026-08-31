@@ -1,0 +1,143 @@
+{
+  "checkpoint": "latest_unet_resnet18_epoch39_backup.pt (epoch 39)",
+  "threshold": 0.35,
+  "baseline_oil_tiles_only": {
+    "iou": 0.1074,
+    "dice": 0.1691,
+    "precision": 0.139,
+    "recall": 0.476,
+    "note": "from docs/metric_audit.md's independent re-verification of the real oil-tiles-only IoU comparison, val set"
+  },
+  "images": [
+    {
+      "image_id": "demo_00_oil_00043",
+      "label": "oil",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill\\images_extracted\\Oil\\00043.tif",
+      "tile_index": 6,
+      "threshold": 0.35,
+      "iou": 0.2861,
+      "dice": 0.4449,
+      "precision": 0.909,
+      "recall": 0.2945,
+      "predicted_oil_pct": 29.3,
+      "true_oil_pct": 90.44
+    },
+    {
+      "image_id": "demo_01_oil_00042",
+      "label": "oil",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill\\images_extracted\\Oil\\00042.tif",
+      "tile_index": 10,
+      "threshold": 0.35,
+      "iou": 0.3517,
+      "dice": 0.5204,
+      "precision": 0.9503,
+      "recall": 0.3583,
+      "predicted_oil_pct": 33.4,
+      "true_oil_pct": 88.59
+    },
+    {
+      "image_id": "demo_02_oil_00059",
+      "label": "oil",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill\\images_extracted\\Oil\\00059.tif",
+      "tile_index": 2,
+      "threshold": 0.35,
+      "iou": 0.3098,
+      "dice": 0.473,
+      "precision": 0.7819,
+      "recall": 0.3391,
+      "predicted_oil_pct": 36.39,
+      "true_oil_pct": 83.92
+    },
+    {
+      "image_id": "demo_03_oil_00269",
+      "label": "oil",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill\\images_extracted\\Oil\\00269.tif",
+      "tile_index": 9,
+      "threshold": 0.35,
+      "iou": 0.5033,
+      "dice": 0.6696,
+      "precision": 0.825,
+      "recall": 0.5634,
+      "predicted_oil_pct": 49.23,
+      "true_oil_pct": 72.09
+    },
+    {
+      "image_id": "demo_04_oil_00341",
+      "label": "oil",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill\\images_extracted\\Oil\\00341.tif",
+      "tile_index": 0,
+      "threshold": 0.35,
+      "iou": 0.4311,
+      "dice": 0.6025,
+      "precision": 0.8007,
+      "recall": 0.4829,
+      "predicted_oil_pct": 35.47,
+      "true_oil_pct": 58.81
+    },
+    {
+      "image_id": "demo_05_oil_01222",
+      "label": "oil",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill\\images_extracted\\Oil\\01222.tif",
+      "tile_index": 7,
+      "threshold": 0.35,
+      "iou": 0.7806,
+      "dice": 0.8768,
+      "precision": 0.8398,
+      "recall": 0.9172,
+      "predicted_oil_pct": 57.34,
+      "true_oil_pct": 52.5
+    },
+    {
+      "image_id": "demo_06_lookalike_00422",
+      "label": "lookalike",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill_part2\\images_extracted\\Lookalike\\00422.tif",
+      "tile_index": 4,
+      "threshold": 0.35,
+      "iou": 0.0,
+      "dice": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "predicted_oil_pct": 100.0,
+      "true_oil_pct": 0.0
+    },
+    {
+      "image_id": "demo_07_lookalike_00564",
+      "label": "lookalike",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill_part2\\images_extracted\\Lookalike\\00564.tif",
+      "tile_index": 7,
+      "threshold": 0.35,
+      "iou": 0.0,
+      "dice": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "predicted_oil_pct": 100.0,
+      "true_oil_pct": 0.0
+    },
+    {
+      "image_id": "demo_08_no_oil_00610",
+      "label": "no_oil",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill_part2\\images_extracted\\No_oil\\00610.tif",
+      "tile_index": 12,
+      "threshold": 0.35,
+      "iou": 0.0,
+      "dice": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "predicted_oil_pct": 92.26,
+      "true_oil_pct": 0.0
+    },
+    {
+      "image_id": "demo_09_no_oil_00262",
+      "label": "no_oil",
+      "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill_part2\\images_extracted\\No_oil\\00262.tif",
+      "tile_index": 6,
+      "threshold": 0.35,
+      "iou": 0.0,
+      "dice": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "predicted_oil_pct": 79.11,
+      "true_oil_pct": 0.0
+    }
+  ]
+}

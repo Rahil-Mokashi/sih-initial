@@ -168,10 +168,6 @@
     .demo-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px 14px;font-size:11px;}
     .demo-stats .stat-label{color:var(--fog-dim);}
     .demo-stats .stat-value{color:var(--paper);font-weight:600;}
-
-    .tile-locations-panel{margin:0 20px 18px;background:var(--navy-app);border:1px solid var(--line-soft);border-radius:10px;padding:14px 16px;}
-    .tile-locations-panel .panel-sub{margin-bottom:10px;}
-    .tile-locations-map{width:100%;height:280px;border:0;border-radius:8px;display:block;}
 </style>
 </head>
 <body>
@@ -1135,13 +1131,7 @@
       </div>
     </div>
     
-    <div class="tile-locations-panel">
-      <div class="panel-title">Tile Locations <span style="font-weight:400;color:var(--fog-dim);font-size:11px;">(real coordinates only -- no drift or attribution computed)</span></div>
-      <div class="panel-sub">These 10 validation tiles have real embedded geographic coordinates but no acquisition timestamp, so no wind/current/AIS-based reconstruction is possible or shown here -- see docs/metric_audit.md and LOG.md. This is location only, unrelated to the ow-0001/ow-0002 drift case study below.</div>
-      <iframe class="tile-locations-map" src="tile_locations.html" title="Real locations of the 10 demo tiles"></iframe>
-    </div>
-
-    <div class="geo-strip" style="display:none">
+    <div class="geo-strip">
       <div class="geo-note">Real geometric characterization &middot; pixel units only &mdash; this dataset's Sentinel-1 product type/ground resolution isn't documented by its source, so no km&sup2; conversion is assumed (see DECISIONS.md)</div>
       <div class="geo-cells">
         

@@ -1,0 +1,13 @@
+{
+  "image_id": "demo_09_no_oil_00262",
+  "label": "no_oil",
+  "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill_part2\\images_extracted\\No_oil\\00262.tif",
+  "tile_index": 6,
+  "threshold": 0.35,
+  "iou": 0.0,
+  "dice": 0.0,
+  "precision": 0.0,
+  "recall": 0.0,
+  "predicted_oil_pct": 79.11,
+  "true_oil_pct": 0.0
+}

@@ -73,9 +73,16 @@ normalization:
   # measured over a 40-image sample (see the metric_audit.md follow-up
   # verification) -- NOT the shared [-40, 10] baseline.yaml uses. This is
   # the one deliberate change from baseline for this arm.
+  #
+  # NODATA EXCLUDED: 1.81% of pixels in both bands are exactly 0.0 dB at
+  # identical spatial locations in both bands (a real nodata mask, not
+  # sensor clipping or a bright-target tail -- see LOG.md). The initial
+  # [p1, p99] = (-33.821, 0.0) computation included these, so its upper
+  # bound was sitting on the nodata plateau, not real signal. Recomputed
+  # with exact-zero pixels dropped before taking percentiles.
   mode: fixed_range
   fixed_range:
-    - [-33.821, 0.0]
+    - [-33.862, -6.324]
 
 augmentation:
   enabled: true

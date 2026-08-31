@@ -80,10 +80,17 @@ normalization:
   # (measured over a 40-image sample -- see the metric_audit.md follow-up
   # verification), applied in channel order [Band 1, Band 2] matching
   # `channels: [1, 2]` above. NOT the shared [-40, 10] baseline.yaml uses.
+  #
+  # NODATA EXCLUDED: 1.81% of pixels in both bands are exactly 0.0 dB at
+  # identical spatial locations in both bands (a real nodata mask, not
+  # sensor clipping or a bright-target tail -- see LOG.md). The initial
+  # computation included these, so both bands' upper bounds were sitting on
+  # the nodata plateau (0.0), not real signal. Recomputed with exact-zero
+  # pixels dropped before taking percentiles.
   mode: fixed_range
   fixed_range:
-    - [-43.673, 0.0]
-    - [-33.821, 0.0]
+    - [-43.710, -12.894]
+    - [-33.862, -6.324]
 
 augmentation:
   enabled: true

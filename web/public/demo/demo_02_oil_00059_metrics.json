@@ -1,0 +1,13 @@
+{
+  "image_id": "demo_02_oil_00059",
+  "label": "oil",
+  "source_image": "D:\\sih26143-oil-spill-attribution\\data\\raw\\zenodo_sar_oil_spill\\images_extracted\\Oil\\00059.tif",
+  "tile_index": 2,
+  "threshold": 0.35,
+  "iou": 0.3098,
+  "dice": 0.473,
+  "precision": 0.7819,
+  "recall": 0.3391,
+  "predicted_oil_pct": 36.39,
+  "true_oil_pct": 83.92
+}
