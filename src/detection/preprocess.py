@@ -147,6 +147,25 @@ def normalize_db_per_channel(image: np.ndarray, ranges: list[tuple[float, float]
     return np.stack([normalize_db_fixed(image[c], lo=ranges[c][0], hi=ranges[c][1]) for c in range(n_channels)])
 
 
+def compute_nodata_mask(band1: np.ndarray, band2: np.ndarray) -> np.ndarray:
+    """
+    Boolean array, True where a pixel is nodata/invalid -- defined as exact
+    0.0 dB in BOTH real SAR bands at the same spatial location.
+
+    Phase 0's Gate C audit (docs/metric_audit.md, LOG.md 2026-08-31) found
+    this is a real nodata mask (edge-of-swath shaped in a spot-checked
+    example), not sensor clipping or a bright-target tail: 1.81% of pixels
+    in a real sample are exactly 0.0 dB in both bands, at IDENTICAL spatial
+    locations (0 pixels differed between the two bands' individual
+    exact-zero sets in that sample) -- consistent with both bands sharing
+    one acquisition footprint. Requiring both bands to be exactly zero
+    (rather than trusting that identity to hold on every image) is the
+    conservative, always-correct definition; it costs one extra cheap
+    windowed band read per tile.
+    """
+    return (band1 == 0.0) & (band2 == 0.0)
+
+
 def tile_image(image: np.ndarray, tile_size: int = 256, stride: int | None = None) -> list[np.ndarray]:
     """
     Cut `image` into tile_size x tile_size patches. Partial edge tiles are

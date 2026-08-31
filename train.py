@@ -179,10 +179,18 @@ def main() -> None:
     tile_size = config.get("tile_size", 512)
     augment_enabled = bool((config.get("augmentation") or {}).get("enabled", True))
 
+    # return_nodata_mask=True unconditionally: exact-0.0-dB nodata pixels
+    # (~1.8% of pixels, see docs/metric_audit.md Finding #12) were being
+    # trained on and scored as if they were real ocean/oil signal, in both
+    # loss and metrics, with no config knob to turn it off -- this is a
+    # correctness fix for every future run through this entrypoint, not an
+    # experimental option (see LOG.md's nodata-masking entry).
     train_dataset = ZenodoTileDataset(train_pairs, tile_size=tile_size, augment=augment_enabled,
-                                       seed=seed or 0, channels=channels, normalize_fn=normalize_fn)
+                                       seed=seed or 0, channels=channels, normalize_fn=normalize_fn,
+                                       return_nodata_mask=True)
     val_dataset = ZenodoTileDataset(val_pairs, tile_size=tile_size, augment=False,
-                                     channels=channels, normalize_fn=normalize_fn)
+                                     channels=channels, normalize_fn=normalize_fn,
+                                     return_nodata_mask=True)
     print(f"train tiles: {len(train_dataset)}, val tiles: {len(val_dataset)}, "
           f"channels={channels}, normalization={norm_desc}")
 

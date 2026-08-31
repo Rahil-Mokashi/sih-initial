@@ -26,7 +26,7 @@ from rasterio.windows import Window
 from torch.utils.data import Dataset
 
 from detection.augment import augment_pair
-from detection.preprocess import lee_filter, normalize_db_fixed, tile_image
+from detection.preprocess import compute_nodata_mask, lee_filter, normalize_db_fixed, tile_image
 
 
 def bbox_to_mask(xml_path: str | Path, image_shape: tuple[int, int]) -> np.ndarray:
@@ -113,6 +113,7 @@ class ZenodoTileDataset(Dataset):
         seed: int = 0,
         channels: tuple[int, ...] = (1,),
         normalize_fn=None,
+        return_nodata_mask: bool = False,
     ):
         """
         channels selects which 1-indexed rasterio bands to read, e.g. (1,)
@@ -130,6 +131,20 @@ class ZenodoTileDataset(Dataset):
         per-band ranges Gate C's audit found necessary (see
         docs/metric_audit.md). Defaults to None, which keeps the exact
         original normalize_db_fixed(image) behavior.
+
+        return_nodata_mask, if True, makes __getitem__ return a THIRD
+        tensor: a (1, H, W) float mask, 1.0 = valid pixel, 0.0 = nodata
+        (see preprocess.compute_nodata_mask -- exact 0.0 dB in both real
+        SAR bands, ~1.8% of pixels, confirmed unmasked in loss/metrics
+        before this was added; see docs/metric_audit.md Finding #12).
+        Always reads both bands to compute it regardless of `channels`
+        (one extra cheap windowed read when channels != (1, 2)), and
+        computes it from the RAW pre-despeckle values -- lee_filter's local
+        averaging would blur exact-zero nodata pixels into non-zero
+        neighbors, destroying the exact-zero signature this detection
+        depends on. Defaults to False: every existing caller (SARTileDataset
+        is unaffected entirely; old scripts/tests using ZenodoTileDataset
+        without this flag) keeps the exact original 2-tuple return.
         """
         self.tile_size = tile_size
         self.stride = stride or tile_size
@@ -138,6 +153,7 @@ class ZenodoTileDataset(Dataset):
         self.pairs = pairs
         self.channels = channels
         self.normalize_fn = normalize_fn or normalize_db_fixed
+        self.return_nodata_mask = return_nodata_mask
 
         self.index: list[tuple[int, int, int]] = []  # (pair_idx, row_off, col_off)
         for i, pair in enumerate(pairs):
@@ -159,8 +175,17 @@ class ZenodoTileDataset(Dataset):
             image = src.read(list(self.channels), window=window).astype(np.float32)  # (C, H, W)
             if len(self.channels) == 1:
                 image = image[0]  # (H, W) -- keeps the exact original single-channel shape/behavior
+            if self.return_nodata_mask:
+                # RAW, pre-despeckle reads -- must happen before lee_filter touches
+                # `image`, since despeckling blurs exact-zero nodata pixels into
+                # non-zero neighbors and would destroy the signal this depends on.
+                raw_band1 = src.read(1, window=window).astype(np.float32)
+                raw_band2 = src.read(2, window=window).astype(np.float32)
         with rasterio.open(pair.mask_path) as src:
             mask = src.read(1, window=window).astype(np.float32)
+
+        if self.return_nodata_mask:
+            valid = (~compute_nodata_mask(raw_band1, raw_band2)).astype(np.float32)  # 1.0 = valid, 0.0 = nodata
 
         image = lee_filter(image)  # per-channel automatically if image is (C, H, W)
 
@@ -170,7 +195,11 @@ class ZenodoTileDataset(Dataset):
         # has compressed the ~50dB range down to [0, 1] (applying it after would
         # inject ~50x too much noise relative to what the std was tuned for).
         if self.augment:
-            image, mask = augment_pair(image, mask, self.rng)
+            if self.return_nodata_mask:
+                image, mask, extras = augment_pair(image, mask, self.rng, extra_masks=[valid])
+                valid = extras[0]
+            else:
+                image, mask = augment_pair(image, mask, self.rng)
 
         image = self.normalize_fn(image)
 
@@ -178,6 +207,10 @@ class ZenodoTileDataset(Dataset):
         if image_t.ndim == 2:
             image_t = image_t.unsqueeze(0)  # (H, W) -> (1, H, W); already (C, H, W) otherwise
         mask_t = torch.from_numpy(mask).unsqueeze(0).float()
+
+        if self.return_nodata_mask:
+            valid_t = torch.from_numpy(np.ascontiguousarray(valid)).unsqueeze(0).float()
+            return image_t, mask_t, valid_t
         return image_t, mask_t
 
 

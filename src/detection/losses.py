@@ -23,10 +23,28 @@ import torch
 import torch.nn as nn
 
 
-def dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def dice_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor | None = None, eps: float = 1e-6) -> torch.Tensor:
+    """
+    mask, if given, is a same-shape (or broadcastable) 1.0=valid/0.0=invalid
+    tensor (see detection.dataset.ZenodoTileDataset's return_nodata_mask) --
+    invalid (nodata) pixels are excluded from both the intersection and the
+    union sums, not just zeroed in isolation. This is safe here specifically
+    because dice is a ratio of SUMS, not a per-element mean: zeroing `probs`
+    and `targets` together at an invalid pixel removes that pixel's
+    contribution from every term (intersection, union) identically, so the
+    ratio is exactly what it would be if the pixel had never existed. (BCE
+    below needs a different fix -- see DiceBCELoss -- because its usual
+    'mean' reduction divides by the total element count regardless of value,
+    so simply zeroing inputs would silently dilute the loss with fake
+    "correct" pixels instead of excluding them.)
+    """
     probs = torch.sigmoid(logits)
     probs = probs.flatten(1)
     targets = targets.flatten(1)
+    if mask is not None:
+        mask = mask.flatten(1)
+        probs = probs * mask
+        targets = targets * mask
     intersection = (probs * targets).sum(dim=1)
     union = probs.sum(dim=1) + targets.sum(dim=1)
     dice = (2 * intersection + eps) / (union + eps)
@@ -41,10 +59,26 @@ class DiceBCELoss(nn.Module):
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
-        self.bce = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        # reduction="none": BCEWithLogitsLoss's default 'mean' divides by the
+        # TOTAL element count, including any nodata pixels we want excluded --
+        # zeroing logits/targets at those pixels would NOT zero their BCE
+        # contribution (BCE(logit=0, target=0) = log(2) != 0) and the fixed
+        # divisor would still silently dilute the loss. Computing per-pixel
+        # and dividing by the actual valid-pixel count (below) is the correct
+        # masked mean; with mask=None this reduces to the exact same value as
+        # the old default-'mean' BCE (mean over all elements either way).
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight, reduction="none")
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return self.dice_weight * dice_loss(logits, targets) + self.bce_weight * self.bce(logits, targets)
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        dice = dice_loss(logits, targets, mask=mask)
+        bce_per_pixel = self.bce(logits, targets)
+        if mask is not None:
+            bce_per_pixel = bce_per_pixel.flatten(1) * mask.flatten(1)
+            valid_counts = mask.flatten(1).sum(dim=1).clamp(min=1.0)
+            bce = (bce_per_pixel.sum(dim=1) / valid_counts).mean()
+        else:
+            bce = bce_per_pixel.mean()
+        return self.dice_weight * dice + self.bce_weight * bce
 
 
 class TverskyLoss(nn.Module):
@@ -67,9 +101,19 @@ class TverskyLoss(nn.Module):
         self.beta = beta
         self.eps = eps
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        # Same masking approach as dice_loss (see its docstring): zeroing
+        # `probs` and `targets` together at an invalid pixel makes it
+        # contribute 0 to tp, fp, AND fn alike (fp = probs*(1-targets) = 0
+        # since probs=0; fn = (1-probs)*targets = 0 since targets=0), which
+        # is safe because tversky, like dice, is a ratio of sums with no
+        # separate total-element-count divisor.
         probs = torch.sigmoid(logits).flatten(1)
         targets = targets.flatten(1)
+        if mask is not None:
+            mask = mask.flatten(1)
+            probs = probs * mask
+            targets = targets * mask
         tp = (probs * targets).sum(dim=1)
         fp = (probs * (1 - targets)).sum(dim=1)
         fn = ((1 - probs) * targets).sum(dim=1)

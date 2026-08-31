@@ -31,17 +31,43 @@ from __future__ import annotations
 import numpy as np
 
 
-def augment_pair(image: np.ndarray, mask: np.ndarray, rng: np.random.Generator, speckle_jitter_std_db: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
-    if rng.random() < 0.5:
-        image, mask = np.flip(image, axis=-1), np.flip(mask, axis=-1)
-    if rng.random() < 0.5:
-        image, mask = np.flip(image, axis=-2), np.flip(mask, axis=-2)
-
+def augment_pair(
+    image: np.ndarray,
+    mask: np.ndarray,
+    rng: np.random.Generator,
+    speckle_jitter_std_db: float = 0.5,
+    extra_masks: list[np.ndarray] | None = None,
+):
+    """
+    extra_masks, if given (e.g. a nodata-validity mask that must stay
+    pixel-aligned with mask/image), is a list of additional (H, W) arrays
+    that get the exact same flips/rotation as image/mask -- same RNG draws,
+    same order, so alignment is preserved -- but NOT the speckle jitter
+    (that's image-signal noise, meaningless for a boolean validity mask).
+    Returns (image, mask) as before when extra_masks is None (unchanged
+    behavior/RNG consumption for every existing caller); returns
+    (image, mask, transformed_extra_masks) when extra_masks is given.
+    """
+    flip_lr = rng.random() < 0.5
+    flip_ud = rng.random() < 0.5
     k = rng.integers(0, 4)  # 0/90/180/270 degree rotation
-    if k:
-        image, mask = np.rot90(image, k, axes=(-2, -1)), np.rot90(mask, k, axes=(-2, -1))
+
+    def apply_geometry(arr: np.ndarray) -> np.ndarray:
+        if flip_lr:
+            arr = np.flip(arr, axis=-1)
+        if flip_ud:
+            arr = np.flip(arr, axis=-2)
+        if k:
+            arr = np.rot90(arr, k, axes=(-2, -1))
+        return np.ascontiguousarray(arr)
+
+    image = apply_geometry(image)
+    mask = apply_geometry(mask)
 
     if speckle_jitter_std_db > 0:
         image = image + rng.normal(0, speckle_jitter_std_db, size=image.shape).astype(np.float32)
+    image = np.ascontiguousarray(image)
 
-    return np.ascontiguousarray(image), np.ascontiguousarray(mask)
+    if extra_masks is None:
+        return image, mask
+    return image, mask, [apply_geometry(m) for m in extra_masks]

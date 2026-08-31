@@ -30,6 +30,18 @@ from torch.utils.data import DataLoader
 from detection.losses import dice_loss
 
 
+def _unpack_batch(batch, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Handles both the plain (images, masks) batches every dataset produced
+    before nodata masking existed, and the (images, masks, valid) batches
+    ZenodoTileDataset(return_nodata_mask=True) now produces -- so this loop
+    doesn't need to know or care which dataset it's iterating."""
+    if len(batch) == 3:
+        images, masks, valid = batch
+        return images.to(device), masks.to(device), valid.to(device)
+    images, masks = batch
+    return images.to(device), masks.to(device), None
+
+
 def capture_rng_state(dataset, device: torch.device) -> dict:
     """Python/NumPy/Torch RNG state, plus a dataset's own augmentation RNG
     if it exposes one (ZenodoTileDataset.rng is a np.random.Generator) --
@@ -89,12 +101,12 @@ def evaluate(model: torch.nn.Module, dataset, loss_fn: torch.nn.Module, device: 
     total_loss, total_dice, n_batches = 0.0, 0.0, 0
     use_amp = device.type == "cuda"
 
-    for images, masks in loader:
-        images, masks = images.to(device), masks.to(device)
+    for batch in loader:
+        images, masks, valid = _unpack_batch(batch, device)
         with torch.amp.autocast("cuda", enabled=use_amp):
             logits = model(images)
-            loss = loss_fn(logits, masks)
-            dice_score = 1 - dice_loss(logits, masks)
+            loss = loss_fn(logits, masks, mask=valid)
+            dice_score = 1 - dice_loss(logits, masks, mask=valid)
         total_loss += loss.item()
         total_dice += dice_score.item()
         n_batches += 1
@@ -237,12 +249,12 @@ def train(
         n_batches = 0
         optimizer.zero_grad()
 
-        for step, (images, masks) in enumerate(loader):
-            images, masks = images.to(device), masks.to(device)
+        for step, batch in enumerate(loader):
+            images, masks, valid = _unpack_batch(batch, device)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 logits = model(images)
-                loss = loss_fn(logits, masks) / grad_accum_steps
+                loss = loss_fn(logits, masks, mask=valid) / grad_accum_steps
 
             scaler.scale(loss).backward()
 

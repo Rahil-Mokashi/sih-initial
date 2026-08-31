@@ -9,6 +9,19 @@
 # reproduces every hyperparameter and preprocessing choice that WAS
 # recorded, so any future run using this file is a fair comparison point
 # going forward.
+#
+# One MORE deliberate divergence from epoch-39, added after this config was
+# first written: train.py now always builds its datasets with
+# return_nodata_mask=True, so exact-0.0-dB nodata pixels (~1.8% of pixels,
+# see docs/metric_audit.md Finding #12) are excluded from loss/metrics for
+# ANY run through train.py, baseline.yaml included -- epoch-39's original
+# run (scripts/train_detection.py, pre-Phase-1) had no such exclusion and
+# never will, since it's a historical checkpoint, not something to be
+# re-run. This is a correctness fix applied going forward, not a knob this
+# config can turn off; a fresh baseline.yaml run is a fair comparison
+# against future exp01-style runs (all of which get the same fix through
+# the same entrypoint), just not a bit-for-bit reproduction of epoch-39's
+# original number, which this file already wasn't (see `seed` above).
 
 experiment_name: baseline_epoch39_reproduction
 
