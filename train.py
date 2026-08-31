@@ -31,6 +31,7 @@ import argparse
 import csv
 import datetime
 import json
+import math
 import random
 import subprocess
 import sys
@@ -167,6 +168,13 @@ def write_run_manifest(config: dict, config_path: Path, output_dir: Path, device
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--max-epochs-override", type=int, default=None,
+                         help="Timing/smoke-test only: stop after this many epochs regardless of the "
+                              "config's own `epochs` value. Does not change checkpointing, logging, or "
+                              "run_manifest.json (those still record the config as written) -- purely caps "
+                              "how many epochs actually run, and triggers an extra per-epoch timing report "
+                              "at the end (wall-clock, steps/sec, peak GPU memory, estimated 25/60-epoch "
+                              "total) so you can measure one real epoch without committing to a full run.")
     args = parser.parse_args()
 
     config = yaml.safe_load(args.config.read_text())
@@ -246,9 +254,16 @@ def main() -> None:
               f"(a warm start, NOT a training-state resume -- an interrupted run of THIS experiment "
               f"still resumes from output_dir/epochs/ automatically if present)")
 
+    effective_epochs = config.get("epochs", 60)
+    if args.max_epochs_override is not None:
+        print(f"--max-epochs-override {args.max_epochs_override}: capping this run at "
+              f"{args.max_epochs_override} epoch(s) (config says epochs: {effective_epochs}) -- "
+              f"timing/smoke purposes only, checkpoints written here are not a real training result.")
+        effective_epochs = args.max_epochs_override
+
     result = train(
         model, train_dataset, loss_fn, device,
-        epochs=config.get("epochs", 60),
+        epochs=effective_epochs,
         batch_size=config.get("batch_size", 16),
         grad_accum_steps=config.get("grad_accum_steps", 1),
         lr=config.get("learning_rate", 1e-3),
@@ -275,6 +290,27 @@ def main() -> None:
     print(f"\nbest val_dice={result.best_val_dice:.4f} at epoch {result.best_epoch} "
           f"(raw val_dice -- see docs/metric_audit.md before trusting this number; "
           f"run scripts/evaluate.py + scripts/sweep_threshold.py against {output_dir / 'best.pt'} for the real metric)")
+
+    if args.max_epochs_override is not None:
+        # steps_per_epoch recomputed independently here (ceil(len(dataset)/batch_size), matching
+        # DataLoader's own __len__ with drop_last=False) rather than by changing what
+        # src/detection/train.py logs -- keeps checkpointing/metrics.jsonl/run_manifest.json behavior
+        # byte-for-byte unchanged; this report is purely a derived view of result.history, printed here.
+        batch_size = config.get("batch_size", 16)
+        steps_per_epoch = math.ceil(len(train_dataset) / batch_size)
+        print(f"\n=== TIMING REPORT (--max-epochs-override {args.max_epochs_override}, "
+              f"{steps_per_epoch} steps/epoch at batch_size={batch_size}) ===")
+        for h in result.history:
+            steps_per_sec = steps_per_epoch / h.seconds if h.seconds > 0 else float("nan")
+            vram_str = f"{h.peak_vram_mb:.0f}MB" if h.peak_vram_mb is not None else "n/a (no CUDA)"
+            est_25h = h.seconds * 25 / 3600
+            est_60h = h.seconds * 60 / 3600
+            print(f"  epoch {h.epoch}: wall-clock={h.seconds:.1f}s  steps/sec={steps_per_sec:.3f}  "
+                  f"peak_vram={vram_str}  est. total @25 epochs={est_25h:.2f}h  @60 epochs={est_60h:.2f}h")
+        print("  NOTE: estimates assume every epoch takes the same time as measured here -- the first "
+              "epoch(s) can include one-time overhead (CUDA context/cuDNN autotune warmup, filesystem "
+              "cache misses on first read of each source image) that later epochs won't pay, so this is "
+              "a rough estimate, not a guarantee. Run more than 1 epoch here if that matters.")
 
 
 if __name__ == "__main__":
