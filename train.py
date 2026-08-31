@@ -239,6 +239,8 @@ def main() -> None:
         metrics_jsonl_path=output_dir / "metrics.jsonl",
         save_rng_state=True,
         resume=True,
+        amp=config.get("amp"),  # None (key absent) = exact old hardcoded "AMP iff cuda" behavior
+        channels_last=bool(config.get("channels_last", False)),
     )
 
     print(f"\nbest val_dice={result.best_val_dice:.4f} at epoch {result.best_epoch} "

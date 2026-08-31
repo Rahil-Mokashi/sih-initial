@@ -30,16 +30,24 @@ from torch.utils.data import DataLoader
 from detection.losses import dice_loss
 
 
-def _unpack_batch(batch, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+def _unpack_batch(batch, device: torch.device, channels_last: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Handles both the plain (images, masks) batches every dataset produced
     before nodata masking existed, and the (images, masks, valid) batches
     ZenodoTileDataset(return_nodata_mask=True) now produces -- so this loop
-    doesn't need to know or care which dataset it's iterating."""
+    doesn't need to know or care which dataset it's iterating.
+
+    channels_last (default False, no change to any existing caller): moves
+    `images` to `device` in torch.channels_last memory format instead of
+    the default contiguous layout. Only `images` -- the tensor that
+    actually flows through the model's conv layers -- not masks/valid,
+    which channels_last has no meaningful effect on."""
     if len(batch) == 3:
         images, masks, valid = batch
-        return images.to(device), masks.to(device), valid.to(device)
+        images = images.to(device, memory_format=torch.channels_last) if channels_last else images.to(device)
+        return images, masks.to(device), valid.to(device)
     images, masks = batch
-    return images.to(device), masks.to(device), None
+    images = images.to(device, memory_format=torch.channels_last) if channels_last else images.to(device)
+    return images, masks.to(device), None
 
 
 def capture_rng_state(dataset, device: torch.device) -> dict:
@@ -93,16 +101,36 @@ class TrainResult:
     best_epoch: int | None = None
 
 
+def _resolve_amp(amp: bool | None, device: torch.device) -> bool:
+    """amp=None (default) reproduces the exact original hardcoded behavior
+    (AMP whenever the device is cuda). An explicit True/False is honored,
+    but only on cuda -- AMP has no meaningful effect on CPU, and the
+    autocast/GradScaler calls below are always parameterized for the
+    "cuda" device_type, so forcing amp=True on a CPU run would be
+    incoherent rather than merely a no-op."""
+    if amp is None:
+        return device.type == "cuda"
+    return bool(amp) and device.type == "cuda"
+
+
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, dataset, loss_fn: torch.nn.Module, device: torch.device, batch_size: int = 8, num_workers: int = 0) -> tuple[float, float]:
-    """Returns (avg_loss, avg_dice_score) over the dataset. Dice score = 1 - dice_loss, so higher is better."""
+def evaluate(model: torch.nn.Module, dataset, loss_fn: torch.nn.Module, device: torch.device, batch_size: int = 8,
+             num_workers: int = 0, amp: bool | None = None, channels_last: bool = False) -> tuple[float, float]:
+    """Returns (avg_loss, avg_dice_score) over the dataset. Dice score = 1 - dice_loss, so higher is better.
+
+    amp: None (default) = old hardcoded "on iff cuda" behavior; True/False
+    explicitly turns AMP on/off (still gated to cuda -- see _resolve_amp).
+    channels_last: converts the model and each image batch to
+    torch.channels_last memory format (a real layout change some conv
+    workloads run faster in on modern GPUs) -- default False, no effect on
+    any existing caller."""
     model.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     total_loss, total_dice, n_batches = 0.0, 0.0, 0
-    use_amp = device.type == "cuda"
+    use_amp = _resolve_amp(amp, device)
 
     for batch in loader:
-        images, masks, valid = _unpack_batch(batch, device)
+        images, masks, valid = _unpack_batch(batch, device, channels_last=channels_last)
         with torch.amp.autocast("cuda", enabled=use_amp):
             logits = model(images)
             loss = loss_fn(logits, masks, mask=valid)
@@ -141,8 +169,22 @@ def train(
     keep_last_n: int = 3,
     metrics_jsonl_path: str | Path | None = None,
     save_rng_state: bool = False,
+    amp: bool | None = None,
+    channels_last: bool = False,
 ) -> TrainResult:
     """
+    amp: None (default) reproduces the exact original hardcoded "AMP iff
+    cuda" behavior for every existing caller. Pass True/False to make it an
+    explicit, config-driven choice instead (see _resolve_amp) -- still only
+    takes effect on cuda.
+
+    channels_last: False (default, no change to any existing caller) keeps
+    the model/inputs in the standard contiguous memory layout. True moves
+    the model to torch.channels_last (a NHWC-equivalent layout some conv
+    workloads run measurably faster in on modern GPU tensor cores) and
+    converts each image batch to match -- masks/valid targets are left
+    alone, channels_last has no meaningful effect on them.
+
     latest_checkpoint_path, if given, is overwritten after every epoch
     (model + optimizer + scaler state, epoch number, best-so-far
     tracking, full history) -- a resume point distinct from
@@ -187,11 +229,14 @@ def train(
     trajectory an uninterrupted run would have taken, not just from the
     same model weights.
     """
-    model.to(device)
+    if channels_last:
+        model.to(device, memory_format=torch.channels_last)
+    else:
+        model.to(device)
     model.train()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler, num_workers=num_workers)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    use_amp = device.type == "cuda"
+    use_amp = _resolve_amp(amp, device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     scheduler = None
     if use_lr_scheduler and val_dataset is not None:
@@ -250,7 +295,7 @@ def train(
         optimizer.zero_grad()
 
         for step, batch in enumerate(loader):
-            images, masks, valid = _unpack_batch(batch, device)
+            images, masks, valid = _unpack_batch(batch, device, channels_last=channels_last)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 logits = model(images)
@@ -274,7 +319,8 @@ def train(
 
         val_loss, val_dice = (None, None)
         if val_dataset is not None:
-            val_loss, val_dice = evaluate(model, val_dataset, loss_fn, device, batch_size=batch_size, num_workers=num_workers)
+            val_loss, val_dice = evaluate(model, val_dataset, loss_fn, device, batch_size=batch_size, num_workers=num_workers,
+                                           amp=amp, channels_last=channels_last)
             if scheduler is not None:
                 lr_before = optimizer.param_groups[0]["lr"]
                 scheduler.step(val_dice if lr_monitor == "val_dice" else val_loss)
