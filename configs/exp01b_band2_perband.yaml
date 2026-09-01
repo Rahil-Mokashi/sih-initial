@@ -11,7 +11,7 @@
 # The other two trained arms are exp01a_band1_perband.yaml (Band 1 alone)
 # and exp01c_both_perband.yaml (both bands, in_channels=2).
 #
-# This is a 25-epoch comparative ablation, not a from-scratch reproduction
+# This is a 15-epoch comparative ablation (lowered from 25), not a from-scratch reproduction
 # of the 60-epoch baseline run: trains on data/processed/train_manifest_ablation.csv
 # (all oil-containing tiles + an equal-count random zero-oil sample, seed 42,
 # + all lookalike tiles -- see scripts/build_ablation_manifest.py; report
@@ -63,7 +63,7 @@ scheduler_parameters: {}
 batch_size: 16
 grad_accum_steps: 1
 num_workers: 6
-epochs: 25  # comparative ablation on the subset manifest below, not the full 60-epoch baseline run
+epochs: 15  # comparative ablation on the subset manifest below, not the full 60-epoch baseline run (lowered from 25)
 keep_last_n: 3
 
 amp: true            # opt-in; see scripts/verify_amp.py for the real per-batch loss delta this makes

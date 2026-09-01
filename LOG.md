@@ -1590,3 +1590,46 @@ directly comparable to the corrected baseline above. No training run yet.
 Test suite: 56/56 passing (36 pre-existing + 20 added this session across
 `test_preprocess.py`, `test_losses.py`, `test_augment.py`, `test_metrics.py`,
 `test_dataset.py`).
+
+---
+
+## 2026-09-01 — Interrupted-run resilience confirmed real, sleep/hibernate +
+ETA reminder, epochs 25 -> 15 for exp01
+
+**Interrupted-run recovery, tested for real, not assumed.** Built a tiny
+scratch manifest (8 real oil train images / 2 real oil val images, seconds
+per epoch instead of minutes) so a kill mid-epoch could actually be
+exercised. Real sequence: epoch 1 completed and saved -> process killed
+mid-epoch-2 -> resumed, correctly printed "continuing at epoch 2/4"
+(not corrupted, not restarted from scratch) -> epoch 2 completed -> killed
+again mid-epoch-3 -> resumed, correctly printed "continuing at epoch 3/4"
+-> ran to completion. Verified directly, not just via the printed message:
+`metrics.jsonl` ended with exactly 4 clean, correctly-ordered lines (no
+duplicates, no truncated JSON), `epochs/` correctly pruned to the last
+`keep_last_n=3` checkpoints, and both `best.pt`/`final.pt` load cleanly
+with the expected keys.
+
+**`on_epoch_end` hook + reminder** (`src/detection/train.py`/`train.py`):
+prints once, after the first epoch that actually runs in that process, a
+one-line "disable sleep/hibernate" reminder plus an estimated wall-clock
+time to completion computed from the REMAINING epoch count at the
+just-measured rate (not a from-scratch total -- matters on a resumed run).
+Confirmed correct on a resumed run specifically: resuming from a real
+epoch-1 checkpoint under a 15-epoch cap printed "continuing at epoch 2/15"
+and the reminder correctly said "13 epoch(s)" remaining, not 14 or 15.
+
+**exp01a/b/c: epochs 25 -> 15.** Confirmed exp01a's existing real
+epoch-1 checkpoint (from the earlier timing-confirmation run, LOG.md
+2026-08-31/09-01) is compatible with the new cap -- checked directly, not
+assumed: per-epoch checkpoints only ever store the CURRENT epoch reached,
+never a target total, so the total epoch count living in the config is
+free to change between runs. Proved it end-to-end: copied the real
+epoch_0001.pt into a scratch dir, pointed a scratch config with `epochs:
+15` at it, and confirmed it resumed with `best_val_dice=0.03138...`
+(matching the real checkpoint's saved value exactly) and correctly
+targeted epoch 2/15.
+
+**Disk space**: confirmed 68.5 GiB free on the repo's drive. Peak combined
+checkpoint footprint for all three 15-epoch arms (3 pruned epoch
+checkpoints + best.pt + final.pt each, ~745MB/arm) is ~2.2GB -- over 30x
+headroom.
