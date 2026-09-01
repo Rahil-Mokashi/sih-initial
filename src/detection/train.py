@@ -22,6 +22,7 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -171,8 +172,18 @@ def train(
     save_rng_state: bool = False,
     amp: bool | None = None,
     channels_last: bool = False,
+    on_epoch_end: Callable[[EpochStats], None] | None = None,
 ) -> TrainResult:
     """
+    on_epoch_end, if given, is called with that epoch's EpochStats right
+    after it's appended to result.history (after the epoch's own print
+    line, before checkpoint/metrics-file writes) -- purely an
+    observability hook, e.g. for a caller that wants to print a one-time
+    "here's the measured rate" message without needing to change this
+    loop's own checkpointing/logging. Defaults to None: zero behavior
+    change for every existing caller. Exceptions inside it are NOT caught
+    -- a broken hook should fail loudly, not silently swallow a real error.
+
     amp: None (default) reproduces the exact original hardcoded "AMP iff
     cuda" behavior for every existing caller. Pass True/False to make it an
     explicit, config-driven choice instead (see _resolve_amp) -- still only
@@ -335,6 +346,9 @@ def train(
         val_str = f"  val_loss={val_loss:.4f}  val_dice={val_dice:.4f}" if val_dataset is not None else ""
         lr_str = f"  lr={optimizer.param_groups[0]['lr']:.2e}"
         print(f"epoch {epoch}/{epochs}  loss={avg_loss:.4f}  time={elapsed:.1f}s  peak_vram={vram_str}{val_str}{lr_str}")
+
+        if on_epoch_end is not None:
+            on_epoch_end(stats)
 
         if metrics_jsonl_path is not None:
             metrics_jsonl_path = Path(metrics_jsonl_path)

@@ -261,6 +261,26 @@ def main() -> None:
               f"timing/smoke purposes only, checkpoints written here are not a real training result.")
         effective_epochs = args.max_epochs_override
 
+    # One-time reminder printed as soon as a real epoch rate exists (right
+    # after epoch 1 -- the earliest point an estimate means anything), not
+    # repeated every epoch. Uses a plain mutable flag rather than a class
+    # since this is the only state it needs.
+    _reminder_state = {"printed": False}
+
+    def _startup_reminder(stats) -> None:
+        if _reminder_state["printed"]:
+            return
+        _reminder_state["printed"] = True
+        # "Time to completion" from HERE, not a from-scratch total -- matters
+        # on a resumed run, where the first epoch to actually run in this
+        # process might already be well past epoch 1.
+        remaining = effective_epochs - stats.epoch
+        eta_hours = stats.seconds * remaining / 3600
+        print(f"\nREMINDER: disable sleep/hibernate on this machine for the duration of this run -- "
+              f"measured {stats.seconds:.0f}s for epoch {stats.epoch}/{effective_epochs}, so the "
+              f"remaining {remaining} epoch(s) is an estimated {eta_hours:.2f}h to completion "
+              f"(rough estimate from one epoch; later epochs may differ).\n")
+
     result = train(
         model, train_dataset, loss_fn, device,
         epochs=effective_epochs,
@@ -285,6 +305,7 @@ def main() -> None:
         resume=True,
         amp=config.get("amp"),  # None (key absent) = exact old hardcoded "AMP iff cuda" behavior
         channels_last=bool(config.get("channels_last", False)),
+        on_epoch_end=_startup_reminder,
     )
 
     print(f"\nbest val_dice={result.best_val_dice:.4f} at epoch {result.best_epoch} "
