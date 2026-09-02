@@ -32,17 +32,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import rasterio
 import torch
+import yaml
 from rasterio.windows import Window
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from detection.inference import load_model_for_inference, predict_probs  # noqa: E402
 from detection.metrics import aggregate_global, tile_metrics  # noqa: E402
-from detection.preprocess import compute_nodata_mask  # noqa: E402
+from detection.preprocess import compute_nodata_mask, normalize_db_per_channel  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VAL_MANIFEST = REPO_ROOT / "data" / "processed" / "val_manifest.csv"
@@ -106,7 +108,25 @@ def cache_needs_update(cache_dir: Path, pairs: list[tuple[Path, Path, str]]) -> 
     return False
 
 
-def cache_probability_maps(model, device, pairs: list[tuple[Path, Path, str]], channels: tuple[int, ...], cache_dir: Path) -> None:
+def normalize_fn_from_config(config_path: Path):
+    """Builds the exact per-band normalize_fn a train.py-driven run used
+    (mirrors train.py's build_normalize_fn), from its config.yaml. Needed
+    because scripts/evaluate.py's default (predict_probs's hardcoded
+    normalize_db_fixed) is the OLD global [-40, 10] range that only the
+    original epoch-39/44 checkpoints were trained under -- feeding a
+    checkpoint trained with per-band normalization (any exp01* config, the
+    Focal/Tversky scratch checkpoints) through that mismatched range would
+    silently produce meaningless predictions, not just a slightly-off
+    metric. Returns (normalize_fn, channels) so callers don't have to parse
+    the config twice."""
+    config = yaml.safe_load(config_path.read_text())
+    ranges = [tuple(r) for r in config["normalization"]["fixed_range"]]
+    channels = tuple(config.get("channels", [1]))
+    return partial(normalize_db_per_channel, ranges=ranges), channels
+
+
+def cache_probability_maps(model, device, pairs: list[tuple[Path, Path, str]], channels: tuple[int, ...], cache_dir: Path,
+                            normalize_fn=None) -> None:
     """One forward pass per tile, per image; writes one .npz per source image
     (probs stacked (n_tiles, H, W) float16 + gt stacked (n_tiles, H, W) uint8
     + valid stacked (n_tiles, H, W) bool -- see detection.preprocess.compute_nodata_mask,
@@ -141,7 +161,7 @@ def cache_probability_maps(model, device, pairs: list[tuple[Path, Path, str]], c
                     raw_band2 = img_src.read(2, window=window).astype(np.float32)
                     valid_tile = ~compute_nodata_mask(raw_band1, raw_band2)
                     gt_tile = mask_src.read(1, window=window).astype(np.float32)
-                    probs = predict_probs(model, image_tile, device)
+                    probs = predict_probs(model, image_tile, device, normalize_fn=normalize_fn)
                     probs_list.append(probs.astype(np.float16))
                     gt_list.append((gt_tile > 0).astype(np.uint8))
                     valid_list.append(valid_tile)
@@ -282,13 +302,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, default=VAL_MANIFEST)
-    parser.add_argument("--channels", type=str, default="1", help="comma-separated 1-indexed rasterio bands, e.g. '1' or '1,2'")
+    parser.add_argument("--channels", type=str, default="1", help="comma-separated 1-indexed rasterio bands, e.g. '1' or '1,2' -- ignored if --config is given (the config's own `channels` wins)")
+    parser.add_argument("--config", type=Path, default=None,
+                         help="a train.py config.yaml (e.g. configs/exp01a_band1_perband.yaml, or a _scratch_*.yaml) to "
+                              "evaluate this checkpoint with ITS OWN per-band normalization range instead of the legacy "
+                              "hardcoded normalize_db_fixed -- required for any checkpoint NOT trained via the original "
+                              "global [-40, 10] range (i.e. anything trained through train.py with a normalization.mode: "
+                              "fixed_range per-band config). Omit only for the original epoch-39/44 checkpoints.")
     parser.add_argument("--threshold", type=float, default=0.5, help="single-threshold report; use scripts/sweep_threshold.py for a full sweep")
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--force-recache", action="store_true")
     args = parser.parse_args()
 
-    channels = tuple(int(c) for c in args.channels.split(","))
+    normalize_fn = None
+    if args.config is not None:
+        normalize_fn, channels = normalize_fn_from_config(args.config)
+        print(f"normalization: per-band, from {args.config} (channels={channels})")
+    else:
+        channels = tuple(int(c) for c in args.channels.split(","))
+        print("normalization: legacy hardcoded normalize_db_fixed ([-40, 10] global range, no --config given)")
     tag = checkpoint_tag(args.checkpoint)
     cache_dir = args.cache_dir or (CACHE_ROOT / tag)
 
@@ -306,7 +338,7 @@ def main() -> None:
     if cache_needs_update(cache_dir, pairs):
         model = load_model_for_inference(args.checkpoint, device, in_channels=len(channels))
         print(f"caching probability maps to {cache_dir} (recomputing/upgrading any file missing the nodata 'valid' mask) ...")
-        cache_probability_maps(model, device, pairs, channels, cache_dir)
+        cache_probability_maps(model, device, pairs, channels, cache_dir, normalize_fn=normalize_fn)
     else:
         print(f"using existing cache at {cache_dir} ({len(pairs)} images already cached, all with nodata masks)")
 

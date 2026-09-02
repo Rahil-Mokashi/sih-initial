@@ -11,6 +11,7 @@ one-line change, not new code written under time pressure.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -33,7 +34,8 @@ def load_model_for_inference(checkpoint_path: str | Path, device: torch.device, 
 
 
 @torch.no_grad()
-def predict_probs(model: torch.nn.Module, image_tile: np.ndarray, device: torch.device) -> np.ndarray:
+def predict_probs(model: torch.nn.Module, image_tile: np.ndarray, device: torch.device,
+                   normalize_fn: Callable[[np.ndarray], np.ndarray] | None = None) -> np.ndarray:
     """
     image_tile: raw (despeckled or not) array in real dB units (calibrated)
     OR already-normalized [0,1] -- pass raw dB and this despeckles +
@@ -47,9 +49,18 @@ def predict_probs(model: torch.nn.Module, image_tile: np.ndarray, device: torch.
     anywhere on a real test tile despite carrying genuine, weaker-than-0.5
     signal, so evaluating at multiple thresholds from one probability map
     is how the real operating point gets found instead of guessed.
+
+    normalize_fn, if given, replaces the default normalize_db_fixed (the
+    original global [-40, 10] range) -- required for any checkpoint trained
+    via train.py's per-band normalization (configs/exp01*, the Focal/Tversky
+    scratch checkpoints), since feeding those a differently-scaled input
+    than they were trained on produces meaningless predictions, not just
+    slightly-off ones. None reproduces the exact prior hardcoded behavior
+    for every existing caller (the original epoch-39/44 checkpoints, which
+    predate per-band normalization and were trained on normalize_db_fixed).
     """
     despeckled = lee_filter(image_tile.astype(np.float32))  # per-channel if image_tile is (C, H, W)
-    normalized = normalize_db_fixed(despeckled)
+    normalized = (normalize_fn or normalize_db_fixed)(despeckled)
 
     if normalized.ndim == 2:
         x = torch.from_numpy(normalized).unsqueeze(0).unsqueeze(0).float().to(device)

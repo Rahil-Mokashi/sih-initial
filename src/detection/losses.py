@@ -81,6 +81,49 @@ class DiceBCELoss(nn.Module):
         return self.dice_weight * dice + self.bce_weight * bce
 
 
+class FocalLoss(nn.Module):
+    """
+    Binary focal loss (Lin et al. 2017): down-weights easy (already
+    well-classified) pixels by (1-p_t)^gamma so hard/rare pixels dominate
+    the gradient, instead of pos_weight's flat per-class multiplier.
+
+    alpha (default 0.25, the paper's own default) balances positive vs.
+    negative class weight independently of gamma's easy-example
+    down-weighting -- this is a deliberately gentler imbalance correction
+    than DiceBCELoss's pos_weight=32.6, added specifically to test whether
+    pos_weight itself (not Dice, not the architecture) is what's pushing
+    exp01a's training toward the near-constant ~0.40-everywhere prediction
+    diagnosed in LOG.md, since focal loss's imbalance handling is additive/
+    multiplicative rather than a single large scalar reweight.
+
+    Masking follows DiceBCELoss.bce's approach, not dice_loss's zero-and-sum
+    trick: per-pixel focal loss has no fixed-count 'mean' reduction to
+    silently dilute (there's no nn.BCEWithLogitsLoss call here), but a
+    masked-out logit still produces a well-defined (nonzero) per-pixel
+    focal value that must be explicitly excluded before averaging, same
+    reasoning as bce_per_pixel there.
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, eps: float = 1e-6):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        probs = torch.sigmoid(logits).flatten(1)
+        targets = targets.flatten(1)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        per_pixel = -alpha_t * (1 - p_t).clamp(min=0).pow(self.gamma) * torch.log(p_t.clamp(min=self.eps))
+        if mask is not None:
+            mask = mask.flatten(1)
+            per_pixel = per_pixel * mask
+            valid_counts = mask.sum(dim=1).clamp(min=1.0)
+            return (per_pixel.sum(dim=1) / valid_counts).mean()
+        return per_pixel.mean()
+
+
 class TverskyLoss(nn.Module):
     """
     Generalizes Dice with independent false-positive/false-negative weights

@@ -44,7 +44,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from detection.dataset import ImageMaskPair, ZenodoTileDataset, compute_oil_tile_weights  # noqa: E402
-from detection.losses import DiceBCELoss, TverskyLoss  # noqa: E402
+from detection.losses import DiceBCELoss, FocalLoss, TverskyLoss  # noqa: E402
 from detection.model import build_model  # noqa: E402
 from detection.preprocess import normalize_db_per_channel  # noqa: E402
 from detection.train import train  # noqa: E402
@@ -142,8 +142,10 @@ def build_loss(config: dict):
                             bce_weight=params.get("bce_weight", 1.0))
     if loss_name == "tversky":
         return TverskyLoss(alpha=params.get("alpha", 0.3), beta=params.get("beta", 0.7))
+    if loss_name == "focal":
+        return FocalLoss(alpha=params.get("alpha", 0.25), gamma=params.get("gamma", 2.0))
     raise NotImplementedError(f"loss {loss_name!r} is not implemented in src/detection/losses.py -- "
-                               f"supported: 'dicebce', 'tversky'")
+                               f"supported: 'dicebce', 'tversky', 'focal'")
 
 
 def write_run_manifest(config: dict, config_path: Path, output_dir: Path, device: torch.device,
