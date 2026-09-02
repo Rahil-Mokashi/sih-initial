@@ -1,0 +1,7 @@
+{
+  "name": "Oil Spill Attribution System",
+  "description": "NTRO Intelligence - Forensic oil spill drift reconstruction and vessel attribution system",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
