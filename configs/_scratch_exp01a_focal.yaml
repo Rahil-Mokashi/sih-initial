@@ -1,0 +1,80 @@
+# SCRATCH, throwaway config -- not one of the three real exp01 arms.
+#
+# Fast diagnostic (see LOG.md 2026-09-01/02 exp01a diagnosis): exp01a
+# (DiceBCELoss, pos_weight=32.6) trained for 15 real epochs and collapsed to
+# a near-constant ~0.40 predicted probability everywhere, regardless of
+# whether a tile has real oil (measured directly via live inference, not
+# inferred from val_dice alone -- see that diagnosis). This is Variant 1 of
+# a 2-variant, 5-epoch-each test of whether a DIFFERENT loss escapes that
+# collapse before committing GPU time to a real 15-epoch run of anything:
+# FocalLoss (src/detection/losses.py, added this session) instead of
+# DiceBCELoss, with pos_weight removed entirely (Focal's alpha/gamma handle
+# imbalance instead of a single large pos_weight scalar). Otherwise
+# identical to configs/exp01a_band1_perband.yaml -- same Band-1-alone
+# input, same ablation subset manifest, same per-band normalization, same
+# amp/channels_last, same seed. FRESH start (resume_from: null, and this
+# output_dir has never been trained into) -- NOT continuing from exp01a's
+# already-collapsed weights, so this is a fair from-scratch comparison.
+#
+# allow_dirty: true because src/detection/losses.py and train.py were
+# modified this session to add FocalLoss/build_loss("focal") support --
+# this run is deliberately from that uncommitted code.
+
+experiment_name: scratch_exp01a_focal
+
+in_channels: 1
+channels: [1]
+
+sampling_strategy: none
+oil_tile_fraction: null
+
+loss: focal
+loss_parameters:
+  alpha: 0.25
+  gamma: 2.0
+
+optimizer: adam
+learning_rate: 0.001
+weight_decay: 0.0
+
+scheduler: none
+scheduler_parameters: {}
+
+batch_size: 16
+grad_accum_steps: 1
+num_workers: 6
+epochs: 5  # fast diagnostic only -- not a real comparative run
+keep_last_n: 3
+
+amp: true
+channels_last: true
+
+seed: 42
+deterministic: false
+
+resume_from: null
+output_dir: data/processed/checkpoints/_scratch_exp01a_focal
+
+allow_dirty: true
+
+tile_size: 512
+lee_filter:
+  window_size: 7
+
+normalization:
+  # Identical to exp01a_band1_perband.yaml -- same per-band Band-1 range.
+  mode: fixed_range
+  fixed_range:
+    - [-43.710, -12.894]
+
+augmentation:
+  enabled: true
+  flips: true
+  rotations_90: true
+  speckle_jitter_std_db: 0.5
+
+dataset:
+  train_manifest: data/processed/train_manifest_ablation.csv
+  val_manifest: data/processed/val_manifest.csv
+  split_seed: 0
+  val_fraction: 0.15

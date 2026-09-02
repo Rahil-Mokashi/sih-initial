@@ -1,0 +1,77 @@
+# SCRATCH, throwaway config -- not one of the three real exp01 arms.
+#
+# Variant 2 of the 2-variant, 5-epoch-each test of whether a different loss
+# escapes exp01a's ~0.40-everywhere prediction collapse (see
+# configs/_scratch_exp01a_focal.yaml's header for the full context).
+# TverskyLoss (already implemented in src/detection/losses.py, no code
+# change needed) instead of DiceBCELoss, alpha=0.3/beta=0.7 (penalizes
+# false negatives more than false positives -- src/detection/losses.py's
+# TverskyLoss docstring already documents this as "the direction a
+# 3%-positive, currently under-predicting class needs", from the earlier
+# full-dataset 60-epoch plateau diagnosis). No pos_weight (Tversky doesn't
+# take one). Otherwise identical to exp01a_band1_perband.yaml -- same
+# Band-1-alone input, ablation subset, per-band normalization, amp/
+# channels_last, seed. FRESH start (resume_from: null, untrained
+# output_dir) -- not continuing from exp01a's collapsed weights.
+#
+# allow_dirty: true -- see the focal variant's header (uncommitted
+# FocalLoss/train.py changes this session; Tversky itself is unmodified
+# code, but the same working tree is dirty for both scratch runs).
+
+experiment_name: scratch_exp01a_tversky
+
+in_channels: 1
+channels: [1]
+
+sampling_strategy: none
+oil_tile_fraction: null
+
+loss: tversky
+loss_parameters:
+  alpha: 0.3   # false-positive weight
+  beta: 0.7    # false-negative weight
+
+optimizer: adam
+learning_rate: 0.001
+weight_decay: 0.0
+
+scheduler: none
+scheduler_parameters: {}
+
+batch_size: 16
+grad_accum_steps: 1
+num_workers: 6
+epochs: 5  # fast diagnostic only -- not a real comparative run
+keep_last_n: 3
+
+amp: true
+channels_last: true
+
+seed: 42
+deterministic: false
+
+resume_from: null
+output_dir: data/processed/checkpoints/_scratch_exp01a_tversky
+
+allow_dirty: true
+
+tile_size: 512
+lee_filter:
+  window_size: 7
+
+normalization:
+  mode: fixed_range
+  fixed_range:
+    - [-43.710, -12.894]
+
+augmentation:
+  enabled: true
+  flips: true
+  rotations_90: true
+  speckle_jitter_std_db: 0.5
+
+dataset:
+  train_manifest: data/processed/train_manifest_ablation.csv
+  val_manifest: data/processed/val_manifest.csv
+  split_seed: 0
+  val_fraction: 0.15
