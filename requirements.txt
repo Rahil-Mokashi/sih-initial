@@ -25,3 +25,6 @@ cdsapi              # ERA5 wind data via the Copernicus Climate Data Store, see 
 folium              # real Leaflet map for the dashboard (src/dashboard/build_map.py)
 pytest              # test suite, see tests/
 pyyaml              # config-driven training (train.py --config configs/*.yaml), see Phase 1 docs
+fastapi             # backend/main.py -- real-data API + upload/inference endpoint for the React dashboard
+uvicorn             # ASGI server for backend/main.py: venv\Scripts\python.exe -m uvicorn backend.main:app --reload --port 8000
+python-multipart    # required by FastAPI's UploadFile (the /api/detect upload endpoint)

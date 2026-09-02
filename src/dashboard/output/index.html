@@ -198,7 +198,7 @@
 
   <div class="print-header">
     <h2>SIH26143 &mdash; Oil Spill Attribution System &mdash; Case Report</h2>
-    <p>Generated 2026-08-27 06:23 UTC &middot; real drift + AIS data throughout, non-final detection checkpoint (see DECISIONS.md)</p>
+    <p>Generated 2026-09-01 10:48 UTC &middot; real drift + AIS data throughout, non-final detection checkpoint (see DECISIONS.md)</p>
     <p>Attribution methodology: First-pass heuristic scoring, not calibrated against labeled ground truth. Lower score = more consistent with being the spill source. `score` is proximity+timing only (the original methodology); `composite_score` additionally factors in real AIS-gap behavioral evidence and is what the ranking below is sorted by. Behavioral/trajectory evidence is checked against the FULL candidate pool (n_candidates below), not just the vessels shown -- see src/attribution/score_vessels.py module docstring and DECISIONS.md 'Full-pool behavioral rescoring' for the real per-case request counts this took.</p>
   </div>
 
@@ -1141,7 +1141,7 @@
       <iframe class="tile-locations-map" src="tile_locations.html" title="Real locations of the 10 demo tiles"></iframe>
     </div>
 
-    <div class="geo-strip" style="display:none">
+    <div class="geo-strip">
       <div class="geo-note">Real geometric characterization &middot; pixel units only &mdash; this dataset's Sentinel-1 product type/ground resolution isn't documented by its source, so no km&sup2; conversion is assumed (see DECISIONS.md)</div>
       <div class="geo-cells">
         
@@ -1172,18 +1172,18 @@
       </div>
       <div class="prov-row">
         <div class="prov-label">Detection model</div>
-        <div class="prov-value">Best so far: epoch 33, val_dice=0.0235</div>
-        <div class="prov-detail">Real training in progress or complete &middot; checkpoint saved 25.7h ago</div>
+        <div class="prov-value">Best so far: epoch 44, val_dice=0.0238</div>
+        <div class="prov-detail">Real training in progress or complete &middot; checkpoint saved 4.6d ago</div>
       </div>
       <div class="prov-row">
         <div class="prov-label">Drift data (ERA5/HYCOM + NCEP/NCAR)</div>
         <div class="prov-value">Live, real particle tracks</div>
-        <div class="prov-detail">Last computed 2m ago</div>
+        <div class="prov-detail">Last computed 5.2d ago</div>
       </div>
       <div class="prov-row">
         <div class="prov-label">GFW vessel data</div>
         <div class="prov-value">Real AIS presence records</div>
-        <div class="prov-detail">Last fetched 10.4h ago</div>
+        <div class="prov-detail">Last fetched 5.6d ago</div>
       </div>
       <div class="prov-row">
         <div class="prov-label">GFW API quota</div>
@@ -1192,7 +1192,7 @@
       </div></div>
   </section>
 
-  <footer class="note">SIH26143 &middot; NTRO &middot; generated 2026-08-27 06:23 UTC &middot; drift map uses real ERA5 + HYCOM output; detection overlay uses the real epoch-39 checkpoint (oil IoU 0.1074) &mdash; see DECISIONS.md.<br>
+  <footer class="note">SIH26143 &middot; NTRO &middot; generated 2026-09-01 10:48 UTC &middot; drift map uses real ERA5 + HYCOM output; detection overlay uses the real epoch-39 checkpoint (oil IoU 0.1074) &mdash; see DECISIONS.md.<br>
   Vessel data: &ldquo;Powered by <a href="https://globalfishingwatch.org" target="_blank" rel="noopener" style="color:var(--amber-bright);">Global Fishing Watch</a>.&rdquo; Non-commercial use, CC BY-NC 4.0.</footer>
 </div>
 

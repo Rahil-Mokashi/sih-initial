@@ -10,6 +10,22 @@ evidence-backed list of suspect vessels — not a single verdict.**
 > the "how do I run this" reference, those two are the "what's actually true right now"
 > reference. They're kept current; this file may lag behind the latest session.
 
+## What this project does
+
+SAR detection (a U-Net + ResNet18 segmentation model) finds candidate oil slicks in
+Sentinel-1 imagery; a physics-based drift model (ERA5/NCEP wind + HYCOM currents +
+Ekman deflection) runs that detection backward in time to estimate where and when the
+spill started; that origin estimate is cross-referenced against real AIS vessel traffic
+(Global Fishing Watch) to produce a ranked, evidence-backed suspect list; the dashboard
+presents all of it together. **Honestly: detection is still being tuned** — the current
+best real held-out oil-tiles-only IoU is **0.1056** (precision **0.1383** — it
+over-triggers on lookalikes/clean ocean more than it should; see
+[`docs/metric_audit.md`](docs/metric_audit.md) and `LOG.md` for the full diagnosis).
+**The dashboard's two case studies (ow-0001, ow-0002) run on separate, time-anchored
+real data** (a real historical detection coordinate/timestamp, real drift/AIS results
+computed for that specific case) — detection does not yet feed the drift/attribution
+stages live, end to end, in one click.
+
 ## Pipeline overview
 
 ```
@@ -33,18 +49,87 @@ SAR image  ──▶  detection model  ──▶  slick mask  ──▶  geometr
 
 Each stage is real and independently runnable — see below.
 
+## Running the demo
+
+### Option A (primary): the React app + FastAPI backend
+
+`oil-spill-attribution-system/` (frontend) + `backend/main.py` (its API). Two
+terminals, both from the repo root:
+
+```
+# Terminal 1 — backend on :8000 (serves real data from data/processed/dashboard/*.json,
+# checkpoint metadata, and a real detection-inference upload endpoint)
+venv\Scripts\python.exe -m uvicorn backend.main:app --port 8000
+
+# Terminal 2 — frontend on :3000 (proxies /api/* to the backend above; no API key
+# needed -- the Gemini dependency in package.json is an unused AI-Studio-template
+# leftover, unused by any real code path)
+cd oil-spill-attribution-system
+npm run dev
+```
+
+Open `http://localhost:3000/`. **What you should see**: real case data, not
+placeholders — real coordinates, real vessel names (e.g. "SANCO SEA", IMO 9204295),
+real AIS-gap evidence text, a rendered drift map. Confirmed working end-to-end this
+session, including both export buttons ("Export Case File" → a real populated JSON
+download, "Generate PDF Report" → a real populated PDF). One known rough edge: the
+PDF/print output shows the dimmed dashboard bleeding through faintly behind the report
+modal (cosmetic, not broken).
+
+### Option B (fallback): the static dashboard
+
+`src/dashboard/output/index.html` — no server process required, no `npm install`, just
+open the file directly in a browser (or serve it — `venv\Scripts\python.exe -m
+http.server 8001 --directory src\dashboard\output`, then open
+`http://localhost:8001/index.html`). **Use this if Option A hits any environment issue
+right before presenting** (a broken `npm install`, a port conflict, etc.) — it's kept
+fully intact specifically as a zero-dependency fallback and needs no server-side setup
+at all. See the "Dashboard" section below for how to rebuild it from scratch.
+
+## Prerequisites
+
+- **Python 3.10+** (developed/tested on 3.10.10). Check: `python --version`.
+- **Node.js 18+** and **npm** (developed/tested on Node 22.18, npm 10.9). Check:
+  `node --version && npm --version`.
+- **GDAL: no separate system install needed.** `rasterio`'s Windows/Linux/Mac wheels
+  (installed via `requirements.txt` below) ship their own bundled GDAL — confirmed on
+  this project's dev machine (`rasterio 1.4.4` bundling `GDAL 3.10.3`, `import rasterio`
+  works with zero OS-level GDAL setup). Only worth revisiting if `pip install rasterio`
+  ever falls back to building from source on an unusual platform.
+- **A CUDA-capable GPU is strongly recommended** for training (not required for running
+  the dashboards or attribution/drift stages, which are CPU-fine) — this project trains
+  on a 6GB RTX 4050 laptop GPU. Without one, `torch.cuda.is_available()` is `False` and
+  training falls back to CPU (correct, just slow).
+
 ## Setup
 
 ```
-# 1. Create/activate the venv (already created at venv/ if you're continuing this project)
+# 0. Clone
+git clone https://github.com/Rahil-Mokashi/sih-initial.git
+cd sih-initial
+
+# 1. Create the venv
 python -m venv venv
 
+# 1b. Activate it
+venv\Scripts\activate          # Windows
+source venv/bin/activate       # Mac/Linux
+
 # 2. Install PyTorch FIRST with the CUDA wheel for your GPU (plain `pip install torch`
-#    gives you a CPU-only build)
-venv\Scripts\pip.exe install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#    gives you a CPU-only build) -- swap cu124 for your CUDA version, or drop
+#    --index-url entirely for CPU-only
+venv\Scripts\pip.exe install torch torchvision --index-url https://download.pytorch.org/whl/cu124   # Windows
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124                    # Mac/Linux, once activated
 
 # 3. Everything else
-venv\Scripts\pip.exe install -r requirements.txt
+venv\Scripts\pip.exe install -r requirements.txt   # Windows
+pip install -r requirements.txt                    # Mac/Linux, once activated
+
+# 4. React app's own dependencies (only needed for the primary dashboard, see
+#    "Running the demo" above)
+cd oil-spill-attribution-system
+npm install
+cd ..
 ```
 
 Verify: `venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"`
@@ -233,3 +318,13 @@ and the dashboard's detection panel gets the improved checkpoint swapped in. Ful
   conversion is applied (checked directly against the dataset's record page, not assumed).
 - Detection model accuracy is genuinely weak and the active subject of tuning trials —
   read LOG.md for the current real numbers rather than trusting this file, which may lag.
+
+## Where to look next
+
+- [`LOG.md`](LOG.md) — the full session-by-session history: what was built, what broke,
+  what was fixed, real numbers throughout. This is the file to read for "what's the
+  actual current state of the detection-tuning work."
+- [`DECISIONS.md`](DECISIONS.md) — why things were built the way they were, and the
+  tradeoffs considered at each real decision point.
+- [`docs/metric_audit.md`](docs/metric_audit.md) — the detection metric audit (why raw
+  `val_dice` was misleading, and how the real IoU/precision/recall numbers were derived).
