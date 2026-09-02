@@ -1131,7 +1131,7 @@
       </div>
     </div>
     
-    <div class="geo-strip">
+    <div class="geo-strip" style="display:none">
       <div class="geo-note">Real geometric characterization &middot; pixel units only &mdash; this dataset's Sentinel-1 product type/ground resolution isn't documented by its source, so no km&sup2; conversion is assumed (see DECISIONS.md)</div>
       <div class="geo-cells">
         
